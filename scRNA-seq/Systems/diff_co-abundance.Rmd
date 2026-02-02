@@ -1,0 +1,889 @@
+# launch an interactive node
+interactive 8 256G 12:00:00 genD
+
+# to launch:
+module load GCC
+conda activate mpa
+
+```{r eval=FALSE}
+
+# input handling packages
+library(yaml)
+library(assertthat)
+
+# data wrangling & plotting packages
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+library(crayon)
+
+# single-cell & data analysis packages
+library(Seurat)
+library(Matrix)
+
+# network analysis
+library(WGCNA)
+library(hdWGCNA)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+
+# set the plotting theme
+theme_set(theme_cowplot())
+
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/systems-wide')
+
+fig_dir <- 'figures/'
+data_dir <- 'data/'
+
+# source helper functions
+source("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/differential/Bcells/scripts/misc/helper_functions.R")
+source("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/differential/Bcells/scripts/plotting/plotting_functions.R")
+
+# Tcell seurat object 
+seurat_tcells <- readRDS( "/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcells_integrated_annotated_seurat.rds")
+seurat_myeloid <- readRDS("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Myeloid/data/Myeloid_integrated_annotated_seurat.rds")
+
+# TODO: from the downstream correlation analysis, we need to exclude the extremely rare B cell types (B transitional and Plasma Mito)
+seurat_bcells <- readRDS("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Bcells/data/Bcells_integrated_annotated_seurat.rds")
+
+seurat_immune_meta <- read.table("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/data/SERPENTINE_Immmune_Harmony_obs.csv", sep=',', header=1)
+head(seurat_immune_meta)
+
+# re-load the correlation data
+load(paste0(data_dir, 'coabundance_corelations.rda'))
+
+```
+
+
+
+Load the liver, lung, and primary milo results for each lineage 
+
+```{r eval=FALSE}
+
+tissues <- c("Liver", "Lung", "Primary")
+lineages <- c("Tcells", "Myeloid", "Bcells")
+milo_comparisons <- paste0("CRC_", tissues, "_T2_vs_T1")
+
+da_results <- data.frame()
+for(cur_lineage in lineages){
+  for(cur_tissue in tissues){
+    cur_comparison <- paste0("CRC_", cur_tissue, "_T2_vs_T1")
+    cur_results <- read.csv(paste0("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/differential/", cur_lineage, "/results/CRC_", cur_tissue,"_T2_vs_T1/milo/CRC_", cur_tissue , "_T2_vs_T1_milo_DA.csv"))
+    cur_results$lineage <- cur_lineage 
+    cur_results$tissue <- cur_tissue
+    da_results <- rbind(da_results, cur_results)
+  }
+}
+
+table(da_results$lineage, da_results$tissue)
+
+```
+
+```{r eval-FALSE}
+
+library(ComplexHeatmap)
+library(circlize)
+set.seed(42)
+
+# helper function to perform CLR normalization of a library by cluster cell counts matrix
+# CLR = log(x / geom_mean(x))
+calc_clr <- function(mat, pseudocount = 1) {
+
+    # add a pseudo-count and calculate proportions
+    mat <- mat + pseudocount
+    props <- mat / rowSums(mat)
+    
+    # geometric mean per row 
+    geom_means <- exp(rowMeans(log(props)))
+    
+    # log of proportion divided by geometric mean
+    clr_mat <- log(props / geom_means)
+    return(clr_mat)
+}
+
+# list of meta-data tables 
+seurat_list <- list(
+    Tcells = seurat_tcells@meta.data,
+    Myeloid = seurat_myeloid@meta.data,
+    Bcells = seurat_bcells@meta.data
+)
+
+cur_tissue <- "Lung"
+cur_tissue <- "Liver"
+
+cor_list <- list()
+for(cur_tissue in c("Liver", "Lung", "Primary")){
+
+  # filter the meta-data to contain only patients of interest
+  meta_combined <- lapply(seurat_list, function(df) {
+      df %>% 
+          filter(
+              Primary_tumor == "CRC",
+              Timepoint %in% c(1, 2),
+              Tissue == cur_tissue
+          ) %>%
+          select(Patient, Timepoint, annotation)
+  }) %>% 
+      bind_rows()
+
+  # only keep patients with >= 25 cells in both timepoints 
+  patients_keep <- meta_combined %>%
+      count(Patient, Timepoint) %>%
+      filter(n >= 25) %>%
+      group_by(Patient) %>%
+      filter(n() >= 2) %>% # Must have both T1 and T2
+      pull(Patient) %>%
+      unique()
+
+  meta <- meta_combined %>%
+      filter(Patient %in% patients_keep)
+
+  # get the cell counts matrices for pre and post treatment timepoints
+  df1 <- subset(meta, Timepoint == 1)
+  df2 <- subset(meta, Timepoint == 2)
+  counts1 <- table(df1$Patient, df1$annotation)
+  counts2 <- table(df2$Patient, df2$annotation)
+
+  annotations_keep <- intersect(colnames(counts1), colnames(counts2))
+  counts1 <- counts1[,annotations_keep]
+  counts2 <- counts2[,annotations_keep]
+
+
+  # perform the CLR transformation
+  clr1 <- calc_clr(counts1)
+  clr2 <- calc_clr(counts2)
+
+  # calculate the delta CLR
+  # + values indicate relative enrichment in T2 vs. T1
+  # - values indicate relative depletion in T2 vs. T1
+  delta_clr <- clr2 - clr1
+
+  # perform pairwise correlation of the delta CLR 
+  # res <- psych::corr.test(delta_clr, method = "spearman")
+  res <- psych::corr.test(delta_clr, method = "pearson")
+  cor_mat <- res$r 
+  res$delta_clr <- delta_clr
+
+  cor_list[[cur_tissue]] <- res
+
+  # 6. Visualize with a heatmap
+  col_fun = colorRamp2(c(-0.9, 0, 0.9), c("blue", "whitesmoke", "red"))
+  # mean_deltas <- colMeans(delta_clr)
+  anno_col_fun <- colorRamp2(c(-1, 0, 1), 
+                          c("dodgerblue", "whitesmoke", "darkgoldenrod1"))
+
+  # calculate the average milo lfcs for this tissue 
+  tmp <- subset(da_results, tissue == cur_tissue) %>%
+    group_by(cluster) %>% summarise(x = mean(logFC))
+  mean_lfcs <- tmp$x; names(mean_lfcs) <- tmp$cluster
+  mean_lfcs <- mean_lfcs[colnames(cor_mat)]
+
+  row_anno <- rowAnnotation(
+      Milo_logFC = mean_lfcs,
+      col = list(Milo_logFC = anno_col_fun),
+      annotation_legend_param = list(Milo_logFC = list(title = "Milo Avg logFC"))
+  )
+
+  pdf(paste0(fig_dir, cur_tissue, "_covarying_celltypes_heatmap.pdf"), width=9, height=8)
+  print(Heatmap(cor_mat, 
+          name = "Pearson Cor",
+          column_title = paste0(cur_tissue, " co-varying CD45+ cell types"),
+          col = col_fun,
+          left_annotation = row_anno, # This adds the bar to the left
+          clustering_distance_rows = "pearson", 
+          clustering_method_rows = "complete",
+                    
+          # Formatting
+          row_names_side = "right",
+          column_names_gp = gpar(fontsize = 8),
+          row_names_gp = gpar(fontsize = 8)
+        )
+  )
+  dev.off()
+
+
+  # 1. Prepare Lineage Mapping and Sort Order
+  # ---------------------------------------------------------
+
+  # Ensure you have a 'lineage' column in your da_results. 
+  # If not, you may need to add it via a case_when or a lookup table.
+  # We'll create a mapping data frame for the clusters present in cor_mat
+  lineage_map <- da_results %>%
+    filter(tissue == cur_tissue) %>%
+    distinct(cluster, lineage) # Assuming 'lineage' exists in da_results
+
+  # Create a data frame for sorting
+  sort_df <- data.frame(cluster = colnames(cor_mat)) %>%
+    left_join(lineage_map, by = "cluster") %>%
+    mutate(milo_lfc = mean_lfcs[cluster]) %>%
+    # Define the lineage order (e.g., T, B, Myeloid) and then sort by LFC
+    mutate(lineage = factor(lineage, levels = c("Tcells", "Bcells", "Myeloid"))) %>%
+    arrange(lineage, desc(milo_lfc))
+
+  # 2. Reorder the matrix and annotations based on the new sort
+  # ---------------------------------------------------------
+  target_order <- sort_df$cluster
+  cor_mat_sorted <- cor_mat[target_order, ] # We only sort the rows (Y-axis)
+  mean_lfcs_sorted <- mean_lfcs[target_order]
+  lineage_split <- sort_df$lineage
+
+  # 3. Setup Colors and Annotations
+  # ---------------------------------------------------------
+  col_fun = colorRamp2(c(-0.9, 0, 0.9), c("blue", "whitesmoke", "red"))
+
+  # Adjusting LFC scale to be symmetric around 0
+  max_abs_lfc <- max(abs(mean_lfcs_sorted), na.rm = TRUE)
+  anno_col_fun <- colorRamp2(c(-1, 0, 1), 
+                            c("dodgerblue", "whitesmoke", "darkgoldenrod1"))
+
+  row_anno <- rowAnnotation(
+      Milo_logFC = mean_lfcs_sorted,
+      col = list(Milo_logFC = anno_col_fun),
+      annotation_legend_param = list(Milo_logFC = list(title = "Milo Avg logFC"))
+  )
+
+  # 1. Define the size of a single tile
+  tile_size <- unit(6, "mm") 
+
+  # 2. Calculate total dimensions
+  # Since this is a correlation matrix, ncol and nrow are the same
+  n_col <- ncol(cor_mat)
+  n_row <- nrow(cor_mat)
+
+  # 4. Generate the Heatmap
+  # ---------------------------------------------------------
+  pdf(paste0(fig_dir, cur_tissue, "_covarying_celltypes_lineage_split_heatmap.pdf"), width=9, height=8)
+
+  print( Heatmap(cor_mat_sorted, 
+          name = "Pearson Cor",
+          column_title = paste0(cur_tissue, " Lineage-Split Co-abundance"),
+
+          # Row Logic: Split by lineage, NO clustering (honor our manual sort)
+          row_split = lineage_split,
+          cluster_rows = FALSE, 
+          row_title_rot = 0, # Keep lineage labels horizontal
+          row_gap = unit(2, "mm"),
+          
+          # Column Logic: Keep clustering to show the modules
+          cluster_columns = TRUE,
+          clustering_distance_columns = "pearson",
+          clustering_method_columns = "complete",
+          
+          col = col_fun,
+          left_annotation = row_anno,
+          
+          # Formatting
+          row_names_side = "right",
+          column_names_gp = gpar(fontsize = 8),
+          row_names_gp = gpar(fontsize = 8))
+  )
+  dev.off()
+
+
+}
+
+#------------------------------------------------------
+# ggplot version (probably not using in the end)
+#------------------------------------------------------
+
+# library(ggdendro)
+
+# cor_mat <- res$r 
+
+# 1. Prepare the Data
+# ---------------------------------------------------------
+# Get the order for the Y-axis (Sorted by Mean Change)
+mean_deltas <- colMeans(delta_clr)
+y_order <- names(sort(mean_deltas, decreasing = TRUE))
+
+# Calculate Hierarchical Clustering for the X-axis
+dist_mat <- as.dist(1 - cor_mat) # Using 1-cor as distance
+hc <- hclust(dist_mat, method = "complete")
+x_order <- hc$labels[hc$order]
+
+# Extract P-values from the psych object
+p_mat <- res$p
+
+# Melt correlation matrix for ggplot
+cor_df <- reshape2::melt(cor_mat)
+p_df <- reshape2::melt(p_mat)
+colnames(cor_df) <- c("Var1", "Var2", "Correlation")
+cor_df$p_val <- p_df$value
+cor_df$fdr <- p.adjust(cor_df$p_val, method='BH')
+
+# Add significance labels (asterisk for p < 0.05)
+cor_df <- cor_df %>%
+  mutate(sig_label = ifelse(p_val < 0.05 & Var1 != Var2, "*", ""))
+
+cor_df$Var1 <- factor(cor_df$Var1, levels = y_order) # Y-axis: Mean Change Sort
+cor_df$Var2 <- factor(cor_df$Var2, levels = x_order) # X-axis: Cluster Sort
+
+# Prepare Mean Change data for the side bar
+mean_df <- data.frame(
+  Annotation = factor(names(mean_deltas), levels = y_order),
+  MeanChange = mean_deltas
+)
+
+write.table(cor_df, file=paste0(data_dir, cur_tissue, '_differential_co-abundance_cd45.csv'), sep=',', row.names=FALSE)
+
+
+```
+
+Permutation test for correlation significance 
+
+First need to run the above block to get cor_list
+
+```{r eval=FALSE}
+
+library(dplyr)
+library(foreach)
+
+# helper function to run the permutation test
+run_permutation_cor <- function(mat, n_perm = 1000) {
+  
+  cell_types <- colnames(mat)
+  n_cells <- length(cell_types)
+  
+  # Initialize result matrix for p-values
+  perm_p_mat <- matrix(NA, nrow = n_cells, ncol = n_cells, 
+                       dimnames = list(cell_types, cell_types))
+  
+  # We only need to test the unique pairs (upper triangle)
+  pairs <- combn(cell_types, 2)
+  
+  message(paste("Running permutations for", ncol(pairs), "pairs..."))
+  
+  for(i in 1:ncol(pairs)) {
+    c1 <- pairs[1, i]
+    c2 <- pairs[2, i]
+    
+    vec1 <- mat[, c1]
+    vec2 <- mat[, c2]
+    
+    # Observed correlation
+    obs_cor <- cor(vec1, vec2, method = "pearson")
+    
+    # Generate null distribution by shuffling one vector
+    null_cors <- replicate(n_perm, {
+      cor(vec1, sample(vec2), method = "pearson")
+    })
+    
+    # P-value: Proportion of null correlations as extreme or more extreme than observed
+    # We use absolute values for a two-tailed test
+    p_val <- sum(abs(null_cors) >= abs(obs_cor)) / n_perm
+    
+    perm_p_mat[c1, c2] <- p_val
+    perm_p_mat[c2, c1] <- p_val
+  }
+  
+  # Fill diagonal with 0 (perfect correlation with self)
+  diag(perm_p_mat) <- 0
+  
+  return(perm_p_mat)
+}
+
+
+# Create a clean Data Frame 
+process_results <- function(r_mat, p_mat, tissue_name) {
+  df <- reshape2::melt(r_mat)
+  colnames(df) <- c("Var1", "Var2", "Correlation")
+  df$p_val <- reshape2::melt(p_mat)$value
+  
+  # Create unique pair ID (alphabetical) to remove duplicates
+  df <- df %>%
+    filter(Var1 != Var2) %>%
+    rowwise() %>%
+    mutate(pair = paste(sort(c(as.character(Var1), as.character(Var2))), collapse = "_")) %>%
+    ungroup() %>%
+    distinct(pair, .keep_all = TRUE) %>%
+    mutate(tissue = tissue_name)
+  
+  return(df)
+}
+
+# run the permutation test per tissue
+for(cur_tissue in tissues){
+  print(cur_tissue)
+  delta_clr <- cor_list[[cur_tissue]]$delta_clr
+  cor_mat <- cor_list[[cur_tissue]]$r
+  perm_p <- run_permutation_cor(delta_clr, n_perm=1000)
+  res <- process_results(cor_mat, perm_p, cur_tissue)
+  res$fdr <- p.adjust(res$p_val, method='BH')
+  cor_list[[cur_tissue]]$permutation <- res
+}
+
+
+res_liver <- cor_list[["Liver"]]$permutation
+res_lung <- cor_list[["Lung"]]$permutation
+
+# Join for the comparison
+compare_df <- inner_join(
+  res_liver %>% select(pair, Correlation_Liver = Correlation, p_Liver = p_val),
+  res_lung %>% select(pair, Correlation_Lung = Correlation, p_Lung = p_val),
+  by = "pair"
+)
+
+# 4. Filter for Significance
+# ---------------------------------------------------------
+# We flag pairs that passed permutation test in either tissue
+compare_df <- compare_df %>%
+  mutate(is_sig = p_Liver < 0.05 | p_Lung < 0.05)
+
+
+# 1. Define thresholds
+rho_thr <- 0.5
+p_thr   <- 0.05
+
+# 2. Prepare labeling and significant quadrant counts
+# ---------------------------------------------------------
+
+# Filter data to include only pairs significant in BOTH for labeling logic
+# and significant in AT LEAST one for count logic
+compare_df <- compare_df %>%
+  mutate(
+    # Label logic: Sig in both AND high correlation in both
+    label_me = ifelse(p_Liver < p_thr & p_Lung < p_thr & 
+                      abs(Correlation_Liver) > rho_thr & 
+                      abs(Correlation_Lung) > rho_thr, 
+                      pair, ""),
+    
+    # Sig status for counting: Must be significant in at least one tissue
+    is_sig = p_Liver < p_thr | p_Lung < p_thr
+  )
+
+# Calculate counts for SIGNIFICANT points only
+sig_quad_counts <- compare_df %>%
+  filter(is_sig) %>%
+  summarise(
+    Q1 = sum(Correlation_Liver > 0 & Correlation_Lung > 0),
+    Q2 = sum(Correlation_Liver < 0 & Correlation_Lung > 0),
+    Q3 = sum(Correlation_Liver < 0 & Correlation_Lung < 0),
+    Q4 = sum(Correlation_Liver > 0 & Correlation_Lung < 0)
+  )
+
+# 3. Build the Plot
+# ---------------------------------------------------------
+
+p <- ggplot(compare_df, aes(x = Correlation_Liver, y = Correlation_Lung)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  
+  # Background points (Non-significant)
+  ggrastr::rasterise(
+    geom_point(data = subset(compare_df, !is_sig), color = "grey90", alpha = 0.2, size = 1), 
+    dpi = 300
+  ) +
+  
+  # Foreground points (Significant in at least one)
+  geom_point(data = subset(compare_df, is_sig), aes(color = is_sig), alpha = 0.8, size = 2) +
+  
+  # Labels for high-confidence conserved/discordant pairs
+  geom_text_repel(
+    aes(label = label_me),
+    size = 3,
+    max.overlaps = 50,
+    box.padding = 0.6,
+    point.padding = 0.3,
+    segment.color = 'black',
+    min.segment.length = 0
+  ) +
+  
+  # Quadrant Annotations (Significant counts only)
+  annotate("text", x = 1.05, y = 1.05, label = paste0(sig_quad_counts$Q1)) +
+  annotate("text", x = -1.05, y = 1.05, label = paste0( sig_quad_counts$Q2)) +
+  annotate("text", x = -1.05, y = -1.05, label = paste0(sig_quad_counts$Q3)) +
+  annotate("text", x = 1.05, y = -1.05, label = paste0(sig_quad_counts$Q4)) +
+  
+  # Aesthetics
+  scale_color_manual(values = c("TRUE" = "firebrick")) +
+  scale_x_continuous(limits = c(-1.1, 1.1), breaks = seq(-1, 1, 0.5)) +
+  scale_y_continuous(limits = c(-1.1, 1.1), breaks = seq(-1, 1, 0.5)) +
+  coord_fixed() +
+  labs(
+    title = "Liver vs. Lung co-abundance concordance",
+    x = "Liver (Pearson r)",
+    y = "Lung (Pearson r)"
+  ) +
+  theme(
+    legend.position = "none", 
+    plot.title = element_text(hjust=0.5),
+      axis.line.x = element_blank(),
+    axis.line.y = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA, linewidth=1),
+    )
+
+
+
+pdf(paste0(fig_dir, "Liver_vs_Lung_covariance_pearson_signif.pdf"), width=10, height=10)
+print(p)
+dev.off()
+
+
+```
+
+
+Visualize the correlations as a network 
+
+Need to first run the block above to get the permutation p-values.
+
+```{r eval=FALSE}
+
+
+
+# Helper function to avoid repeating theme/scale code
+apply_net_style <- function(p, title) {
+  p + 
+    geom_node_point(aes(fill=mean_lfc), size=5, shape=21, color='white', stroke=1) +
+    geom_node_text(aes(label=lab), repel=TRUE, max.overlaps=Inf, size=4) +
+    scale_edge_colour_gradient(
+      low='whitesmoke', 
+      high='darkgrey',
+      limits = c(0.6, 0.9),
+      oob = scales::squish
+      ) +
+    scale_fill_gradient2(
+      high='darkgoldenrod1', 
+      mid='whitesmoke', 
+      low='dodgerblue',
+      limits = c(-1,1),
+      oob = scales::squish
+    ) +
+    ggtitle(title) + 
+    theme_void() + # Use theme_void for networks to remove gridlines
+    theme(plot.title = element_text(hjust=0.5, face="bold"))
+}
+
+
+
+
+
+#  Helper function to calculate stats for a specific edge subset
+calculate_network_stats <- function(base_graph, direction = "pos") {
+  
+  # Filter edges based on correlation sign
+  if(direction == "pos") {
+    sub_tg <- base_graph %>% activate(edges) %>% filter(Correlation > 0)
+  } else {
+    sub_tg <- base_graph %>% activate(edges) %>% filter(Correlation < 0)
+  }
+  
+  # Calculate Node Metrics
+  sub_tg <- sub_tg %>%
+    activate(nodes) %>%
+    mutate(
+      degree = centrality_degree(weights = weight),
+      betweenness = centrality_betweenness(weights = weight, normalized = TRUE),
+      eigen = centrality_eigen(weights = weight),
+      community = as.factor(group_leiden(weights = abs(Correlation)))
+    )
+  
+  # Calculate Global Metrics
+  ig <- as.igraph(sub_tg)
+  trans <- transitivity(ig, type = "global")
+  mod <- tryCatch(
+    modularity(ig, as.numeric(V(sub_tg)$community), weights = abs(E(ig)$Correlation)),
+    error = function(e) NA
+  )
+  
+  return(list(nodes = as_tibble(sub_tg), transitivity = trans, modularity = mod))
+}
+
+
+
+# create the network and the layout for each tissue
+for(cur_tissue in names(cor_list)){
+  print(cur_tissue)
+  cor_df <- cor_list[[cur_tissue]]$permutation
+  cor_mat <- cor_list[[cur_tissue]]$r
+
+  # get the average milo effect size:
+  tmp <- subset(da_results, tissue == cur_tissue) %>%
+    group_by(cluster) %>% summarise(x = mean(logFC))
+  mean_lfcs <- tmp$x; names(mean_lfcs) <- tmp$cluster
+  mean_lfcs <- mean_lfcs[colnames(cor_mat)]
+
+  # 1. Create a Master Graph containing ALL significant edges
+  # ---------------------------------------------------------
+  master_df <- cor_df %>%
+    subset(p_val < 0.05 & abs(Correlation) > 0.6)
+
+  master_graph <- master_df %>% 
+    igraph::graph_from_data_frame(directed=FALSE) %>%
+    tidygraph::as_tbl_graph(directed=FALSE) %>%
+    tidygraph::activate(nodes)
+
+  E(master_graph)$weight <- abs(E(master_graph)$Correlation)
+
+  # Add the node attributes to the master graph
+  V(master_graph)$mean_lfc <- mean_lfcs[V(master_graph)$name]
+
+  # 2. Create the Master Layout (Fixed coordinates)
+  # ---------------------------------------------------------
+  # We use the master graph so that ALL relevant nodes are assigned a position
+  lay <- ggraph::create_layout(master_graph, layout = 'igraph', algorithm = 'nicely')
+
+  cor_list[[cur_tissue]]$graph_df <- master_df
+  cor_list[[cur_tissue]]$graph <- master_graph
+  cor_list[[cur_tissue]]$layout <- lay 
+
+} 
+
+
+# plot the network and the network stats for each group
+for(cur_tissue in names(cor_list)){
+  print(cur_tissue)
+  g <- cor_list[[cur_tissue]]$graph
+
+
+  # Run analysis for both directions
+  master_tg <- as_tbl_graph(g)
+  pos_results <- calculate_network_stats(master_tg, "pos")
+  neg_results <- calculate_network_stats(master_tg, "neg")
+
+  # Combine into a single Node Dataframe
+  node_df <- pos_results$nodes %>%
+    select(name, mean_lfc, pos_degree = degree, pos_betw = betweenness, pos_eigen = eigen) %>%
+    left_join(
+      neg_results$nodes %>% 
+        select(name, neg_degree = degree, neg_betw = betweenness, neg_eigen = eigen),
+      by = "name"
+    )
+
+  node_df$pos_label <- ifelse(
+    node_df$pos_degree > quantile(node_df$pos_degree, 0.75) | 
+    node_df$pos_betw > quantile(node_df$pos_betw, 0.75), 
+    node_df$name, NA 
+  )
+  labels <- unique(na.omit(node_df$pos_label)) 
+
+
+  node_df$neg_label <- ifelse(
+    node_df$neg_degree > quantile(node_df$neg_degree, 0.75) | 
+    node_df$neg_betw > quantile(node_df$neg_betw, 0.75),
+    node_df$name, NA 
+  )
+
+  # ranking nodes:
+  p1  <- node_df %>%
+    ggplot(aes(x = pos_degree, y = pos_betw)) + 
+    geom_point(aes(size=pos_eigen, fill=mean_lfc), shape=21, color='white') +
+    geom_point(data=subset(node_df, !is.na(pos_label)), aes(size = pos_eigen, fill = mean_lfc), shape=21, color='black', stroke=0.5) +
+    geom_text_repel(aes(label=pos_label), max.overlaps=Inf, size=4) +
+    scale_fill_gradient2(
+      low='dodgerblue',
+      mid='whitesmoke',
+      high='darkgoldenrod1',
+      limits = c(-1,1),
+      oob = scales::squish
+    ) + 
+    scale_size_continuous(limits=c(0,1), range=c(2,6)) +
+      theme(
+        panel.grid.major=element_blank(),
+        panel.grid.minor=element_blank(),
+        plot.title = element_text(hjust=0.5),
+    ) +
+      xlab('Degree') + ylab("Betweenness") + 
+      ggtitle(paste0(cur_tissue, " + edges"))
+
+  p2  <- node_df %>%
+    ggplot(aes(x = neg_degree, y = neg_betw)) + 
+  geom_point(aes(size=neg_eigen, fill=mean_lfc), shape=21, color='white') +
+    geom_point(data=subset(node_df, !is.na(neg_label)), aes(size = neg_eigen, fill = mean_lfc), shape=21, color='black', stroke=0.5) +    geom_text_repel(aes(label=neg_label), max.overlaps=Inf, size=4) +
+    scale_fill_gradient2(
+      low='dodgerblue',
+      mid='whitesmoke',
+      high='darkgoldenrod1',
+      limits = c(-1,1),
+      oob = scales::squish
+    ) + 
+    scale_size_continuous(limits=c(0,1), range=c(2,6)) +
+      theme(
+        panel.grid.major=element_blank(),
+        panel.grid.minor=element_blank(),
+        plot.title = element_text(hjust=0.5),
+    ) +
+      xlab('Degree') + ylab("Betweenness") + 
+      ggtitle(paste0(cur_tissue, " - edges"))
+
+  patch <- (p1 | p2) + plot_layout(guides='collect')
+
+    pdf(paste0(fig_dir, cur_tissue, "_covarying_cell_types_network_stats.pdf"), width=9, height=4)
+    print(patch)
+    dev.off()
+
+    pdf(paste0(fig_dir, cur_tissue, "_covarying_cell_types_network_stats_big.pdf"), width=20, height=10)
+    print(patch)
+    dev.off()
+
+
+  #----------------------------------------------------------#
+  # Plot the networks!
+  #----------------------------------------------------------#
+
+  cor_list[[cur_tissue]]$graph_df -> graph_df
+    cor_list[[cur_tissue]]$graph -> master_graph
+    cor_list[[cur_tissue]]$layout -> lay 
+
+  node_df$pos_label <- ifelse(
+    node_df$pos_degree > quantile(node_df$pos_degree, 0.75) | 
+    node_df$pos_betw > quantile(node_df$pos_betw, 0.75) | 
+    abs(node_df$mean_lfc) > 0.75,
+    node_df$name, NA 
+  )
+  labels <- unique(na.omit(node_df$pos_label)) 
+
+  lay$lab <- ifelse(lay$name %in% labels, lay$name, NA)
+
+    # Positive Plot
+    p1 <- ggraph(lay) + 
+        ggrastr::rasterise(
+          geom_edge_link(
+            aes(
+              color=abs(Correlation), 
+            # alpha=abs(Correlation), 
+              filter = Correlation > 0
+            ), 
+            linewidth=0.5
+          ), dpi=300) 
+    p1 <- apply_net_style(p1, paste0(cur_tissue, " positive correlations"))
+
+    # Negative Plot
+    p2 <- ggraph(lay) + 
+        ggrastr::rasterise(
+          geom_edge_link(
+            aes(
+              color=abs(Correlation), 
+              # alpha=abs(Correlation), 
+              filter = Correlation < 0), 
+            linewidth=0.5, linetype='dashed'
+          ), dpi=300)
+    p2 <- apply_net_style(p2, paste0(cur_tissue, " negative correlations"))
+
+    patch <-  ( p1 | p2 ) + plot_layout(guides='collect')
+
+    pdf(paste0(fig_dir, cur_tissue, "_covarying_cell_types_network_signif.pdf"), width=12, height=5)
+    print(patch)
+    dev.off()
+
+
+    pdf(paste0(fig_dir, cur_tissue, "_covarying_cell_types_network_signif_pos.pdf"), width=5, height=4)
+    print(p1)
+    dev.off()
+
+    pdf(paste0(fig_dir, cur_tissue, "_covarying_cell_types_network_signif_pos_big.pdf"), width=10, height=8)
+    print(p1)
+    dev.off()
+
+}
+
+
+
+# save the correlation info
+save(cor_list, file=paste0(data_dir, 'coabundance_corelations.rda'))
+
+
+```
+
+
+
+
+
+OLD BELOW, IGNORE 
+
+
+Test performing MiloR on a single patient 
+
+It is not possible to do this with a single patient! The model doesn't work when there's only N=1 per group.
+
+```{r eval=FALSE}
+
+library(miloR)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+
+# load the T cell milo object
+milo_obj <- readRDS("/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/results/CRC_Liver_T2_vs_T1/milo/CRC_Liver_T2_vs_T1_milo.rds")
+
+table(colData(milo_obj)$Patient, colData(milo_obj)$Timepoint)
+
+dim(milo_obj)
+
+#------------------------------------------------------
+# Create the design matrix
+#------------------------------------------------------
+
+table(colData(milo_obj)$Patient, colData(milo_obj)$Timepoint)
+
+
+reduction_milo <- 'X_PCA_CELLANOVA'
+replicate_col <- 'Replicate'
+condition <- 'Timepoint'
+subset_cols_split <- c('Patient')
+subset_groups_split <- list('Patient' = c("Patient 33", "Patient 34"))
+exclude_cols_split <- c()
+covariates <- c()
+g1_name <- '2'; g2_name <- '1'
+
+meta_cols <- c(condition, subset_cols_split, exclude_cols_split, covariates)
+
+# initialize the design matrix:
+design_df <- as.data.frame(colData(milo_obj))[,c(replicate_col, meta_cols)]
+
+# subset the design matrix if necessary
+if(!is.null(subset_groups_split)){
+  for(j in 1:length(subset_cols_split)){
+    cur_subset <- subset_cols_split[j]
+    cur_groups <- subset_groups_split[[cur_subset]]
+    design_df <- design_df %>% subset(
+      as.character(get(cur_subset)) %in% cur_groups
+    )
+  }
+}
+
+
+design_df <- fix_metadata(
+  design_df,
+  cols = meta_cols
+)
+
+g1_name_fix <- fix_metadata(g1_name)
+g2_name_fix <- fix_metadata(g2_name)
+
+
+# create the design matrix 
+design_df <- design_df[,c(replicate_col, paste0(meta_cols, '_fix'))] %>% 
+  as.data.frame() %>% 
+  dplyr::distinct()
+
+head(design_df)
+
+# re-name the row and column names
+colnames(design_df) <- c(replicate_col, meta_cols)
+rownames(design_df) <- design_df[,replicate_col]
+
+# set up the contrast of interest!
+cur_contrast <- paste0(paste0(condition, g1_name_fix), '-', paste0(condition, g2_name_fix))
+
+# define the formula
+formula <- as.formula(paste0(c("~ 0", covariates, condition), collapse=" + "))
+
+
+#------------------------------------------------------
+# Run the differential abundance test
+#------------------------------------------------------
+
+da_results <- miloR::testNhoods(
+  milo_obj, 
+  design = formula, 
+  design.df = design_df, 
+  model.contrasts = cur_contrast,
+  fdr.weighting = "graph-overlap", 
+  norm.method = "TMM",
+  reduced.dim = reduction_milo
+)
+
+
+```

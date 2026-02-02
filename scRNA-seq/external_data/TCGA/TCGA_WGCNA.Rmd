@@ -1,0 +1,616 @@
+
+
+Use WGCNA to calculate module eigengenes for this dataset!!! 
+
+Note: I have downloaded all of the original WGCNA tutorials, they are located on my CNAG google drive at this link:
+https://drive.google.com/drive/folders/1EZAAe7hdkQt0h9Fz42umnqwQyTH3a0ay?usp=drive_link
+
+
+Also look at molecular subtypes (iCluster, CMS, etc)
+
+
+TODO:
+
+clean up code and save the outputs
+
+
+Load and set up the TCGA bulk RNA-seq dataset, and load single-cell data
+
+coonda activate mpa
+
+```{r eval=FALSE}
+
+library(WGCNA)
+library(Seurat)
+library(hdWGCNA)
+library(Matrix)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(SummarizedExperiment)
+
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+library(MetBrewer)
+library(ggpubr)
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+
+theme_set(theme_cowplot())
+
+
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/external_data/TCGA/')
+data_dir <- 'data/'
+fig_dir <- 'figures/'
+
+
+# re-load TCGA dataset 
+tcga_data <- readRDS(file=paste0(data_dir, 'TCGA_summarizedExperiment_unprocessed.rds'))
+
+#---------------------------------------------------------------
+# subset features to match 10X data
+#---------------------------------------------------------------
+
+# load features from 10X:
+features <- read.table(file=paste0(data_dir, 'features.tsv'), sep='\t')
+
+# only keep genes that are also found in our single-cell data
+tmp <- do.call(rbind, str_split(rowData(tcga_data)$gene_id, '[.]'))[,1]
+ix <- match(tmp, features$V1)
+genes_10X <- features$V2[ix]
+rowData(tcga_data)[,'genes_10X'] <- genes_10X
+tcga_data <- tcga_data[!is.na(rowData(tcga_data)$genes_10X),]
+
+#---------------------------------------------------------------
+# Add additional subtype metadata
+#---------------------------------------------------------------
+
+# COAD and READ are the same here!!
+coad_subtype <- TCGAquery_subtype(tumor = 'coad')
+ucec_subtype <- TCGAquery_subtype(tumor = 'ucec')
+
+tmp <- dplyr::left_join(
+  as.data.frame(colData(tcga_data)),
+  coad_subtype,
+  by = 'patient'
+)
+
+cols_transfer <- colnames(coad_subtype)[! colnames(coad_subtype) %in% colnames(colData(tcga_data))]
+
+# add the columns
+colData(tcga_data) <- cbind(colData(tcga_data), tmp[,cols_transfer])
+
+clinical <- as.data.frame(colData(tcga_data))
+tmp <- colnames(clinical)[grepl("metast|site|event|tumor", colnames(clinical), ignore.case = TRUE)]
+tmp
+
+head(clinical[,tmp[1:5]])
+
+#---------------------------------------------------------------
+# subset just to keep CRC samples (for now)
+#---------------------------------------------------------------
+
+# subset CRC samples
+tcga_data <- tcga_data[,colData(tcga_data)$project_id %in% c('TCGA-COAD', 'TCGA-READ')]
+
+# subset only primary tumors 
+tcga_data <- tcga_data[,tcga_data$tumor_descriptor == 'Primary']
+
+# subset by MSI status 
+tcga_data <- tcga_data[,tcga_data$MSI_status %in% c('MSS', 'MSI-L', 'MSI-H')]
+
+dim(tcga_data)
+
+#---------------------------------------------------------------
+# normalize the data
+#---------------------------------------------------------------
+
+# normalize w/ vst
+counts <- assays(tcga_data)$unstranded # is this the correct assay to use?
+norm_counts <-  DESeq2::vst(counts)
+
+# change the rownames from ensembl to gene_symbol
+rownames(norm_counts) <- rowData(tcga_data)$genes_10X
+
+#-----------------------------------------------------------------
+# load hdWGCNA datasets
+#-----------------------------------------------------------------
+
+# load the Seurat object 
+seurat_full <- readRDS("/home/groups/singlecell/smorabito/analysis/SERPENTINE/clustering/Tcells/data/Tcells_integrated_annotated_seurat.rds")
+
+# project modules pairwise:
+networks <- c('Liver_T1', 'Lung_T1', 'Lymph_T1', 'Primary_T1')
+
+# load the 3 datasets:
+seurat_list <- lapply(networks, function(cur_net){
+    print(cur_net)
+    cur_obj <- readRDS(paste0("/home/groups/singlecell/smorabito/analysis/SERPENTINE/hdWGCNA_test/Tcells/data/Tcells_", cur_net, '_hdWGCNA.rds'))
+
+    # update the lv2 
+    cur_obj$lv2 <- factor(
+      as.character(cur_obj$lv2),
+      levels = levels(seurat_full$lv2)
+    )
+    cur_obj
+})
+names(seurat_list) <- networks
+
+```
+
+Calculate synthetic module eigengenes
+and decoupleR scores 
+
+```{r eval=FALSE}
+
+cur_network <- 'Primary_T1'
+cur_network <- 'Liver_T1'
+cur_network <- 'Lung_T1'
+cur_network <- 'Lymph_T1'
+
+seurat_obj <- SetActiveWGCNA(seurat_list[[cur_network]], cur_network)
+genes_use <- GetWGCNAGenes(seurat_obj, cur_network)
+
+#-----------------------------------------------------------------
+# 1. clustering to detect & remove outlier samples
+#
+# There's maybe 1 or 2 outliers
+#-----------------------------------------------------------------
+
+# set up the data 
+datExpr <- as.data.frame(t(norm_counts[rownames(norm_counts) %in% genes_use, ]))
+
+# flag genes and samples with too many missing values
+gsg <- goodSamplesGenes(datExpr, verbose = 3);
+gsg$allOK
+
+# keep only good genes and good samples:
+datExpr <- datExpr[gsg$goodSamples , gsg$goodGenes]
+
+# cluster the samples based on these genes
+sampleTree <- hclust(dist(datExpr), method = "average");
+
+pdf(paste0(fig_dir, cur_network,'_sample_clustering.pdf'), width=20, height=9)
+par(cex = 0.6);
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 0.5,
+    cex.axis = 1.5, cex.main = 2)
+abline(h = 150, col = "red");
+dev.off()
+
+
+clust <- cutreeStatic(sampleTree, cutHeight = 150, minSize = 10)
+table(clust)
+
+# remove the outliers 
+datExpr <- datExpr[clust != 0,]
+nGenes <- ncol(datExpr)
+nSamples <- nrow(datExpr)
+
+#-----------------------------------------------------------------
+# 2. Calculate Synthetic Module Eigengenes:
+#-----------------------------------------------------------------
+
+# get the modules of interest, only keep genes that are also 
+# in the bulk RNA-seq dataset
+modules <- GetModules(seurat_obj, wgcna_name = cur_network) %>% 
+  subset(gene_name %in% colnames(datExpr)) 
+
+modules <- modules[colnames(datExpr),]
+
+# remove NA values:
+modules <- na.omit(modules)
+
+datExpr <- datExpr[,modules$gene_name]
+
+colors <- modules$module; names(colors) <- modules$gene_name
+
+# calculate module eigengenes
+syn_MEList <- WGCNA::moduleEigengenes(
+  datExpr, 
+  colors = as.vector(colors)
+)
+
+syn_MEs <- syn_MEList$eigengenes
+colnames(syn_MEs) <- gsub('[ME]', '', colnames(syn_MEs))
+
+# calculate signed adjacency
+adj <- WGCNA::adjacency(
+  datExpr,
+  type = 'signed',
+  power = 6,
+  corFnc = WGCNA::cor
+)
+
+all.equal(names(colors), colnames(datExpr))
+
+# calculate intramodular connectivity
+syn_k <- WGCNA::intramodularConnectivity(
+  adj,
+  colors
+)
+
+# calculate kMEs
+syn_kMEs <- WGCNA::signedKME(
+  datExpr, 
+  syn_MEList$eigengenes,
+  outputColumnName = 'kME_'
+)
+
+# add the gene name and the module name 
+syn_kMEs <- cbind(
+  data.frame(
+    gene_name = names(colors),
+    module = as.character(colors)
+  ),
+  syn_kMEs
+)
+
+#-----------------------------------------------------------------
+# Add patient metadata to the ME table, and 
+# set up the table for plotting
+#-----------------------------------------------------------------
+
+mods <- levels(modules$module); mods <- mods[mods != 'grey']
+mod_colors <- dplyr::select(modules, c(module, color)) %>% distinct()
+mod_cp <- mod_colors$color; names(mod_cp) <- as.character(mod_colors$module)
+
+syn_MEs$barcode <- rownames(syn_MEs)
+
+# exclude the grey module 
+syn_MEs <- syn_MEs[,colnames(syn_MEs) != 'grey']
+
+# cast the result from wide to long
+synME_df <- tidyr::pivot_longer(
+  syn_MEs,
+  cols = all_of(mods)) %>% 
+  dplyr::rename(module = name, score = value)
+
+# # add patient info for plotting 
+# tmp <- left_join(
+#   synME_df, 
+#   as.data.frame(colData(tcga_data)),
+#   by = 'barcode'
+# ) 
+# synME_df$MSI_status <- as.character(tmp$MSI_status)
+
+# synME_df <- subset(synME_df, MSI_status %in% c("MSS", "MSI-H", "MSI-L"))
+# synME_df$MSI_status <- factor(
+#   as.character(synME_df$MSI_status),
+#   levels = c('MSS', 'MSI-L', 'MSI-H')
+# )
+
+#-----------------------------------------------------------------
+# Calculate decoupleR scores
+#-----------------------------------------------------------------
+
+# get the connectivity for each gene
+mods <- unique(syn_kMEs$module); mods <- mods[mods != 'grey']
+hub_df <- do.call(rbind, lapply(mods, function(cur_mod){
+  cur <- subset(syn_kMEs, module == cur_mod)
+  cur <- cur[,c('gene_name', 'module', paste0('kME_', cur_mod))]
+  names(cur)[3] <- 'kME'
+  cur <- dplyr::arrange(cur, desc(kME))
+  cur %>% dplyr::slice_max(n=Inf, order_by=kME)
+}))
+rownames(hub_df) <- 1:nrow(hub_df)
+
+# scale the expression matrix 
+X_z <- t(scale(datExpr))
+
+# calculate MLM scores w/ decoupleR
+MLM_df <- decoupleR::run_mlm(
+  mat = X_z,
+  net = hub_df,
+  .source = 'module',
+  .target = 'gene_name',
+  .mor = 'kME'
+)
+MLM_df <- dplyr::rename(MLM_df, module = source, barcode = condition)
+
+# # add patient info for plotting 
+# tmp <- left_join(
+#   MLM_df, 
+#   as.data.frame(colData(tcga_data)),
+#   by = 'barcode'
+# )
+# MLM_df$MSI_status <- as.character(tmp$MSI_status)
+
+# MLM_df <- subset(MLM_df, MSI_status %in% c("MSS", "MSI-H", "MSI-L"))
+# MLM_df$MSI_status <- factor(
+#   as.character(MLM_df$MSI_status),
+#   levels = c('MSS', 'MSI-L', 'MSI-H')
+# )
+
+#-----------------------------------------------------------------
+# Plot signatures by 
+#-----------------------------------------------------------------
+
+my_comparisons <- list(c("MSS", "MSI-L"), c("MSI-L", "MSI-H"), c("MSS", "MSI-H"))
+
+signature_df <- synME_df 
+meta_df <- as.data.frame(colData(tcga_data))
+sample_col <- 'barcode'
+
+plot_df <- left_join(
+  as.data.frame(signature_df), 
+  as.data.frame(meta_df),
+  by = 'barcode'
+)
+
+# plot the signatures
+p <- SignatureDistPlot(
+  synME_df,
+  meta_df,
+  sample_col = 'barcode',
+  signature_col = 'module',
+  score_col = 'score',
+  group_by = 'MSI_status',
+  signature_cp = mod_cp,
+  ncol=7, 
+  raster_dpi = 500,
+  comparisons = my_comparisons,
+  box_fill = 'whitesmoke',
+  box_alpha = 0.5
+) + ylab('Module eigengene')
+
+
+pdf(paste0(fig_dir, cur_network, '_TCGA_WGCNA_MEs2.pdf'), width=12, height=6)
+print(p) 
+dev.off()
+
+
+# plot the signatures
+p <- SignatureDistPlot(
+  MLM_df,
+  meta_df,
+  sample_col = 'barcode',
+  signature_col = 'module',
+  score_col = 'score',
+  group_by = 'MSI_status',
+  signature_cp = mod_cp,
+  ncol=7, 
+  raster_dpi = 500,
+  comparisons = my_comparisons,
+  box_fill = 'whitesmoke',
+  box_alpha = 0.5
+) + ylab('decoupleR MLM score')
+
+pdf(paste0(fig_dir, cur_network, '_TCGA_decoupleR_scores2.pdf'), width=12, height=6)
+print(p) 
+dev.off()
+
+#-------------------------------------------------------------------------
+# What's up with the MSI NA group?
+#-------------------------------------------------------------------------
+
+my_comparisons <- list(c("M0", "M1"))
+
+# plot the signatures
+p <- SignatureDistPlot(
+  MLM_df,
+  meta_df,
+  sample_col = 'barcode',
+  signature_col = 'module',
+  score_col = 'score',
+  group_by = 'distant_metastasis_pathologic_spread',
+  signature_cp = mod_cp,
+  ncol=7, 
+  raster_dpi = 500,
+  comparisons = my_comparisons,
+  box_fill = 'whitesmoke',
+  box_alpha = 0.5,
+  box_notch = FALSE
+) + ylab('decoupleR MLM score')
+
+pdf(paste0(fig_dir, cur_network, '_TCGA_decoupleR_scores_tumorstage.pdf'), width=12, height=6)
+print(p) 
+dev.off()
+
+
+#-------------------------------------------------------------------------
+# Correlate DecoupleR scores and MEs just to show how similar they are ?
+#-------------------------------------------------------------------------
+
+MLM_df <- MLM_df %>% arrange(barcode, module)
+synME_df <- synME_df %>% arrange(barcode, module)
+
+plot_df <- MLM_df %>% dplyr::rename(score_decoupleR = score)
+plot_df$score_wgcna <- synME_df$score
+
+p <- plot_df %>% 
+  ggplot(aes(x = score_wgcna, y = score_decoupleR)) + 
+  ggrastr::rasterise(geom_point(aes(color=module)), dpi=300) + 
+  geom_vline(xintercept = 0, color='black', linewidth=0.5, linetype='dashed') + 
+  geom_hline(yintercept = 0, color='black', linewidth=0.5, linetype='dashed') + 
+  geom_smooth(method='lm', color='darkgrey') +
+  scale_color_manual(values = mod_cp) +
+  stat_cor(method = "pearson",color='black', aes(label = ..r.label..)) +
+  ggtitle(paste0("WGCNA vs. decoupleR module scoring for ", cur_network)) +
+  theme(
+      axis.line.x = element_blank(),
+      axis.line.y = element_blank(),
+      panel.border = element_rect(linewidth=1,color='black', fill=NA),
+      #panel.grid.major.x = element_line(linewidth=0.5, color='lightgrey'),
+     # panel.grid.major.y = element_line(linewidth=0.25, color='lightgrey'),
+      plot.title = element_text(hjust=0.5)
+  ) + NoLegend() + ylab('decoupleR MLM score') + xlab('WGCNA Module Eigengene') + RotatedAxis() 
+
+patch <- p + facet_wrap(~module, scales='free', ncol=5)
+
+pdf(paste0(fig_dir, cur_network, '_TCGA_WGCNA_vs_decoupleR.pdf'), width=9, height=7)
+print(patch) 
+dev.off()
+
+```
+
+# Survival analysis 
+
+```{r eval=FALSE}
+
+#-----------------------------------------------------------------
+#
+# Stratify patients by Quintiles of Module expression
+#
+#-----------------------------------------------------------------
+
+cur_mod <- 'Lung_T1_4'
+
+for(cur_mod in mods){
+  print(cur_mod)
+  cur_df <- subset(synME_df, module == cur_mod)
+
+  cur_df$quintile <- cut(cur_df$score, breaks = quantile(cur_df$score, probs = seq(0, 1, 0.2), na.rm = TRUE), include.lowest = TRUE, labels = paste0("Q", 1:5))
+
+  tmp <- dplyr::left_join(
+    cur_df,
+    as.data.frame(colData(tcga_data)),
+    by = 'barcode'
+  )
+  cur_df$patient <- tmp$patient
+
+  cur_df <- cur_df %>% group_by(patient) %>% slice_max(n=1, order = quintile) %>% ungroup %>% 
+    dplyr::select(c(patient, quintile)) %>% distinct()
+
+
+  library(survival)
+  library(survminer)
+
+  # load the table with the survival info
+  survival_df <- read.table(paste0(data_dir, 'TCGA_survival.txt'), sep='\t', header=TRUE) %>% dplyr::rename(patient = bcr_patient_barcode)
+
+  # we have survival info for most of the patients
+  table(tcga_data$patient %in% survival_df$patient)
+
+  survival_df <- subset(survival_df, patient %in% cur_df$patient)
+
+  # add MSI status 
+  tmp <- dplyr::left_join(
+    survival_df,
+    cur_df,
+    by = 'patient'
+  )
+  survival_df$quintile <- tmp$quintile 
+
+
+  fit <- survfit(Surv(OS.time, OS) ~ quintile, data = survival_df)
+
+  # Plot KM curve
+  p <- ggsurvplot(fit, data = survival_df, pval = TRUE, risk.table = TRUE,
+            xlab = "Time (days)", ylab = "Overall Survival",
+            palette = "Dark2", title = "Survival by Module Expression Quintile")
+
+
+  pdf(paste0(fig_dir, cur_network, '_survival_', cur_mod, '.pdf'), width=7, height=9)
+  print(p) 
+  dev.off()
+
+}
+
+
+# discard NAs for MSI status 
+survival_df <- subset(survival_df, MSI_status %in% c("MSS", "MSI-H", "MSI-L"))
+
+fit <- survfit(Surv(OS.time, OS) ~ MSI_status, data = survival_df)
+
+# Plot KM curve
+p <- ggsurvplot(fit, data = survival_df, pval = TRUE, risk.table = TRUE,
+           xlab = "Time (days)", ylab = "Overall Survival",
+           palette = "Dark2", title = "Survival by Module Expression Quintile")
+
+
+pdf(paste0(fig_dir, cur_network, '_test_survival.pdf'), width=9, height=7)
+print(p) 
+dev.off()
+
+```
+
+
+
+
+
+```{r eval=FALSE}
+#-----------------------------------------------------------------
+# Calculate a network for this dataset?
+#-----------------------------------------------------------------
+
+# optionally enable multithreading
+enableWGCNAThreads(nThreads = 8)
+
+# Choose a set of soft-thresholding powers
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+# Call the network topology analysis function
+sft = pickSoftThreshold(datExpr, powerVector = powers, verbose = 5)
+
+pdf(paste0(fig_dir, 'tcga_COAD_softpower.pdf'), width=10, height=5)
+# Plot the results:
+par(mfrow = c(1,2));
+cex1 = 0.9;
+# Scale-free topology fit index as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=cex1,col="red");
+# this line corresponds to using an R^2 cut-off of h
+abline(h=0.80,col="red")
+# Mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+dev.off()
+
+
+
+# need to make sure it's using the WGCNA version of cor or else 
+# it gives an error (https://www.biostars.org/p/326569/)
+cor <- WGCNA::cor
+net <- WGCNA::blockwiseModules(datExpr, power = 6,
+                     TOMType = "signed", minModuleSize = 50,
+                     reassignThreshold = 0, 
+                     mergeCutHeight = 0.15,
+                     detectCutHeight = 0.995,
+                     numericLabels = TRUE,
+                     saveTOMs = TRUE,
+                     maxBlockSize = 30000, blocks=NULL,
+                     deepSplit = 4,
+                     saveTOMFileBase = "TCGA_TOM", verbose = 3)
+
+
+
+# Convert labels to colors for plotting
+mergedColors = labels2colors(net$colors)
+table(mergedColors)
+
+pdf(paste0(fig_dir, 'tcga_COAD_dendro.pdf'), width=10, height=5)
+
+# Plot the dendrogram and the module colors underneath
+plotDendroAndColors(net$dendrograms[[1]], mergedColors[net$blockGenes[[1]]],
+                  "Module colors",
+                  dendroLabels = FALSE, hang = 0.03,
+                  addGuide = TRUE, guideHang = 0.05)
+dev.off()
+
+
+```
+
+survival analysis? 
+
+```{r eval=FALSE}
+
+survival_df <- read.table(paste0(data_dir, 'TCGA_survival.txt'), sep='\t', header=TRUE)
+
+```
+
+
+1. Clustering samples to detect / remove outliers:
+
+```{r eval=FALSE}
+
+```
+
+

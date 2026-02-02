@@ -1,0 +1,166 @@
+#--------------------------------------------------------------------#
+# dataset info
+#--------------------------------------------------------------------#
+
+# file path to the anndata object
+adata_path:
+  "/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcells_integrated_annotated.h5ad"
+
+# file path to the corresponding seurat object
+seurat_path:
+  "/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcells_integrated_annotated_seurat.rds"
+
+# define output directory and name to append to output files:
+outdir: 
+  "results/"
+
+#--------------------------------------------------------------------#
+# DEG settings
+# These settings should be the same for all the DEG tests
+#
+# TODO:
+# Move the adata_path and the seurat_path to inside the comparisons
+#--------------------------------------------------------------------#
+
+# global filtering criteria:
+min_cells_group: 200
+min_cells_replicate: 10
+
+# define the comparisons
+#
+# Could this be defined programatically, based on some template?
+comparisons:
+
+  CRC_Liver_vs_Lung_T1:
+    groupby: 'annotation'
+    clusters: 
+    replicate: 'Patient' # Patient or Replicate?
+    condition: 'Liver_met'
+    group1: 'Yes'
+    group2: 'No'
+    subset:
+      Primary_tumor: ["CRC"]
+      Tissue: ["Liver", "Lung"]
+      Timepoint: [1]
+    covariates: 
+    milo_setup:
+      k: 30 # k used to make the graph 
+      prop: 0.05 # proportion of the dataset to sample when generating neighborhoods
+      reduction: "X_pca_CellANOVA"
+      dims: 30 # number of dimensions to use to make the neighborhoods
+      mixed_prop: 0.7 # the minimum proportion of a milo neighborhood to be assigned to as single cell populatioh, else it is classified as "Mixed"
+      subset: False
+
+
+#--------------------------------------------------------------------#
+# Settings for different DEG tests:
+#--------------------------------------------------------------------#
+
+tests:
+
+  memento: 
+    run: "conda run --name scanpy-081124 python scripts/analysis/run_memento.py"
+    options:
+      cell_thresh: 10
+      filter_thresh: 0.07
+      capture_rate: 0.25
+      num_boot: 5000
+      num_cpus: 16
+      verbose: True
+      effect_thresh: 1.0 # used for filtering the results
+
+  wilcox:
+    run: "conda run --name mpa Rscript scripts/analysis/run_FindMarkers.R"
+    options:
+      test_use: wilcox
+      assay: RNA
+      slot: data
+      min_pct: 0
+
+  MAST:
+    run: "conda run --name mpa Rscript scripts/analysis/run_FindMarkers.R"
+    options:
+      test_use: MAST
+      assay: RNA
+      slot: data
+      min_pct: 0
+
+#--------------------------------------------------------------------#
+# Plotting settings
+#
+# TODO: add more settings for colors, etc.
+#--------------------------------------------------------------------#
+
+volcano: 
+  width: 5
+  height: 5
+  de_signif: "de_fdr"
+  de_effect: "log2_de"
+  dv_signif: "dv_pval"
+  dv_effect: "log2_dv"
+  effect_thresh: 1.0
+  title_size: 12
+
+multivolcano:
+  width: 10
+  height: 1 # height is dynamically determined by the number of clusters
+  de_signif: "de_fdr"
+  de_effect: "log2_de"
+  dv_signif: "dv_pval"
+  dv_effect: "log2_dv"
+  effect_thresh: 1.0
+  title_size: 12
+
+milo_reduction:
+  width: 10
+  height: 10
+  reduction: "X_umap"
+  signif_col: "PValue"
+
+milo_boxplot:
+  width: 8
+  height: 8
+  signif_col: "PValue"
+
+proportion_barplot:
+  width: 10
+  height: 4
+
+cell_count_barplot:
+  width: 7
+  height: 10
+
+#--------------------------------------------------------------------#
+# EnrichR settings
+# just use the same settings as the volcano plot so they are consistent
+#--------------------------------------------------------------------#
+
+enrichment:
+  width: 9
+  height: 6
+  db_files:
+    - GO_dbs/GO_Biological_Process_2025.txt
+    - GO_dbs/GO_Cellular_Component_2025.txt
+    - GO_dbs/GO_Molecular_Function_2025.txt
+    - GO_dbs/KEGG_2021_Human.txt
+    - GO_dbs/WikiPathways_2024_Human.txt
+  dbs:
+    - GO_Biological_Process_2023
+    - GO_Cellular_Component_2023
+    - GO_Molecular_Function_2023
+    - KEGG_2021_Human
+    - WikiPathways_2024_Human
+
+
+#--------------------------------------------------------------------#
+# settings for DA tests
+#--------------------------------------------------------------------#
+
+# options for creating the SCE / Milo object, which is applicable across
+
+
+# da_tests:
+  
+#   milo1:
+#     run: "conda run --name scanpy-081124 python scripts/analysis/run_milo.R" # this is the path to the script to run miloR
+#     options:

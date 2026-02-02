@@ -1,0 +1,771 @@
+
+```{bash eval=FALSE}
+
+module load GCC 
+conda activate scanpy-081124
+conda activate mpa
+
+```
+
+```{r eval=FALSE}
+
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(stringi)
+library(RColorBrewer)
+library(MetBrewer)
+theme_set(theme_cowplot())
+
+library(yaml)
+
+# set the project directory 
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/')
+data_dir <- 'data/'
+fig_dir <- 'testing/'
+
+```
+
+Check different milo outputs:
+
+
+```{r eval=FALSE}
+
+library(Seurat)
+library(miloR)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(tidyverse)
+
+source("scripts/plotting/plotting_functions.R")
+source("scripts/misc/helper_functions.R")
+
+
+# working config file
+config_file <- "/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/config.yml"
+config <- yaml::read_yaml(config_file)
+
+config_df <- read.table("/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/config.tsv", sep='\t', header=1)
+
+# load the seurat object
+if(!file.exists(config$seurat_path)){
+  stop(paste0("Path to Seurat Object specified in config file does not exist. config: ", config_file, ', seurat_path: ', config$seurat_path))
+}
+seurat_obj <- readRDS(config$seurat_path)
+
+
+cur_comparison <- 'CRC_Liver_vs_Lung_T1'
+
+
+
+# output name
+outdir <- opt$outdir
+
+# comparison and cluster names
+cur_comparison <- opt$comparison
+
+# subset the table to get the options:
+cur_config <- config_df %>% subset(
+  comparison == cur_comparison 
+)
+
+# load the milo object based on the config file
+milo_obj <- readRDS(paste0("results/", cur_comparison, "/milo/", cur_comparison, "_milo.rds"))
+
+# load the milo test results:
+da_results <- read.csv(paste0("results/", cur_comparison, "/milo/", cur_comparison, "_milo_DA.csv"))
+
+# get the group variable:
+group_var <- unique(cur_config$groupby)
+
+# condition info for the DEG comparison
+condition <- cur_config$condition[1]
+g1_name <- cur_config$group1[1]
+g2_name <- cur_config$group2[1] 
+
+# replicate info 
+replicate_col <- unique(cur_config$replicate)
+reps_remove <- strsplit(cur_config$remove_replicates, ';')[[1]]
+
+# additional subsetting:
+subset_cols <- cur_config$subset_cols[1]
+subset_groups <- cur_config$subset_groups[1]
+
+# settings for milo setup 
+milo_setup <- config$comparisons[[cur_comparison]]$milo_setup 
+k <- milo_setup$k 
+prop <- milo_setup$prop
+reduction <- milo_setup$reduction 
+dims <- milo_setup$dims
+mixed_prop <- milo_setup$mixed_prop
+
+# get the list of covariates
+covariates <- config$comparisons[[cur_comparison]]$covariates
+
+
+
+
+#------------------------------------------------------
+# Plotting the resutls (having errors currently)
+#------------------------------------------------------
+
+outdir <- 'testing/'
+plot_width <- 10 
+plot_height <- 10
+
+pl_opt <- config$milo_boxplot 
+plot_width <- pl_opt$width
+plot_height <- pl_opt$height
+
+p <- DABoxPlot(
+  da_results,
+  signif_col = 'PValue'
+) + 
+  ggtitle(paste0(g1_name, ' vs. ', g2_name))
+
+
+pdf(paste0(outdir, cur_comparison, '_milo_distributions.pdf'), width=plot_width, height=plot_height)
+print(p)
+dev.off()
+
+
+head(da_results)
+
+subset(da_results, PValue < 0.05) %>% dim
+subset(da_results, FDR < 0.05) %>% dim
+subset(da_results, SpatialFDR < 0.05) %>% dim
+
+reduction_plot <- 'X_UMAP'
+
+p <- DAReductionPlot(
+    milo_obj,
+    da_results,
+    centroids = group_var,
+    reduction = reduction_plot,
+    signif_col = 'PValue'
+) + 
+  ggtitle(paste0(g1_name, ' vs. ', g2_name)) + 
+  coord_fixed()
+
+pdf(paste0(outdir, cur_comparison, '_milo_reduction2.pdf'), width=plot_width, height=plot_height)
+print(p)
+dev.off()
+
+
+#------------------------------------------------------
+# How many things per cluster
+#------------------------------------------------------
+
+pl_opt <- config$proportion_barplot 
+plot_width <- pl_opt$width
+plot_height <- pl_opt$height
+
+p <- ProportionBarPlot(
+  object = milo_obj,
+  group_var = group_var,
+  condition = condition,
+  g1_name = g1_name,
+  g2_name = g2_name,
+  replicate_col = replicate_col,
+  reps_remove = reps_remove,
+  subset_groups = subset_groups,
+  subset_cols = subset_cols
+) +  ggtitle(paste0(g1_name, ' vs. ', g2_name))
+
+
+pdf(paste0(outdir, cur_comparison, '_milo_proportions.pdf'), width=plot_width, height=plot_height)
+print(p)
+dev.off()
+
+p <- ProportionBarPlot(
+  object = milo_obj,
+  group_var = group_var,
+  condition = condition,
+  g1_name = g1_name,
+  g2_name = g2_name,
+  replicate_col = replicate_col,
+  reps_remove = reps_remove,
+  subset_groups = subset_groups,
+  subset_cols = subset_cols,
+  plot_raw_counts = TRUE
+) +  ggtitle(paste0(g1_name, ' vs. ', g2_name)) 
+
+
+pdf(paste0(outdir, cur_comparison, '_milo_cell_counts.pdf'), width=7, height=10)
+print(p)
+dev.off()
+
+
+
+cur_meta <- as.data.frame(colData(milo_obj))
+
+# subset the seurat metadata by cluster
+cur_meta <- cur_meta %>%
+    subset(get(condition) %in% c(g1_name, g2_name))
+
+# additional subsetting?
+if(!any(subset_groups == "")){
+    subset_cols_split <- strsplit(subset_cols, ';')[[1]]
+    subset_groups_split <- strsplit(subset_groups, ';')[[1]]
+    for(j in 1:length(subset_cols_split)){
+        cur_subset <- subset_cols_split[j]
+        cur_groups <- strsplit(subset_groups_split[j], ',')[[1]]
+        cur_meta <- cur_meta %>% subset(
+        get(cur_subset) %in% cur_groups
+        )
+    }
+}
+
+
+# filter out replicates that are underrepresented
+cur_meta <- cur_meta %>% subset(!(get(replicate_col) %in% reps_remove))
+
+# set up for calculating proportions
+conditions <- c(g1_name, g2_name)
+clusters  <- cur_meta[,group_var] %>% unique %>% as.character
+scale_vec <- table(cur_meta[,condition])
+
+
+# loop over each cluster and calculate the proportion for each condition
+proportion_df <- data.frame()
+for(i in 1:length(clusters)){
+  cluster_meta <- subset(cur_meta, get(group_var) == clusters[i])
+  cur_df <- as.data.frame(table(cluster_meta[,condition])) %>% dplyr::rename(Count = Freq)
+
+  # compute the non-normalized % of cells in each group
+  cur_df$Freq <- cur_df$Count / sum(cur_df$Count)
+
+  # scale frequency to the total number of clusters in each Tissue
+  cur_df$Scaled <- cur_df$Count / scale_vec
+  cur_df$Scaled <- cur_df$Scaled / sum(cur_df$Scaled)
+
+  # add to ongoing proportion df
+  cur_df$cluster <- clusters[i]
+  proportion_df <- rbind(proportion_df, cur_df)
+}
+
+proportion_df <- proportion_df %>% dplyr::rename(condition = Var1)
+
+
+# order by highest counts:
+total_counts <- proportion_df %>% group_by(cluster) %>% summarise(
+  n_cells = sum(Count)
+) 
+
+cluster_order <- total_counts %>% arrange(n_cells) %>% .$cluster
+
+proportion_df$cluster <- factor(
+  as.character(proportion_df$cluster),
+  levels = cluster_order
+)
+
+proportion_df$hjust_val <- ifelse(proportion_df$Count > 500, 1.1, -0.1)
+
+# set the color scheme
+cp <- c('darkgoldenrod1', 'dodgerblue')
+names(cp) <- conditions
+
+# initialize the plot
+p <- ggplot(proportion_df, aes(x=Count, y=cluster, fill=condition)) +
+    geom_bar(position='dodge', stat='identity') +
+    geom_text(
+      aes(label = Count, hjust=hjust_val),
+      position = position_dodge(width=1),
+    )
+
+# add thematic elements 
+p <- p + scale_x_continuous(expand = c(0,0)) +
+    scale_fill_manual(values=cp) +
+    xlab("Cell counts") + ylab('') +
+    theme(
+          axis.line.x = element_line(colour='black'),
+          axis.line.y = element_line(colour='black'),
+          panel.grid.major.x = element_line(linewidth=0.5, color='lightgrey'),
+          plot.title = element_text(hjust=0.5),
+        )
+pdf(paste0(outdir, cur_comparison, '_cell_counts.pdf'), width=10, height=10)
+print(p)
+dev.off()
+
+#------------------------------------------------------
+# number of DEGs vs. Cell counts?
+#------------------------------------------------------
+
+cur_test <- 'memento'
+cur_test <- 'MAST'
+cur_test <- 'wilcox'
+
+deg_df <- read.csv(file = paste0("results/combined/degs/", cur_comparison, "_", cur_test, '_DEGs.csv'))
+
+signif_col <- 'de_pval'
+
+deg_df$cluster <- factor(deg_df$cluster, levels=cluster_order)
+
+# calculate the number of significant DEGs per clustre
+signif_df_up <- deg_df %>% 
+  subset(get(signif_col) < 0.05 & log2_de >= 0.5) %>%
+  group_by(cluster) %>%
+  summarise(n_degs = n()) %>%
+  complete(cluster, fill = list(n_degs = 0)) %>% 
+  mutate(condition = g1_name)
+
+# calculate the number of significant DEGs per clustre
+signif_df_down <- deg_df %>% 
+  subset(get(signif_col) < 0.05  & log2_de <= -0.5) %>%
+  group_by(cluster) %>%
+  summarise(n_degs = n()) %>%
+  complete(cluster, fill = list(n_degs = 0)) %>% 
+  mutate(condition = g2_name)
+
+signif_df <- rbind(signif_df_down, signif_df_up)
+
+tmp1 <- left_join(
+  subset(proportion_df, condition == g1_name),
+  signif_df_up, 
+  by = 'cluster'
+)
+
+tmp2 <- left_join(
+  subset(proportion_df, condition == g2_name),
+  signif_df_down, 
+  by = 'cluster'
+)
+
+plot_df <- rbind(tmp1, tmp2)
+
+p <- plot_df %>% 
+  ggplot(aes(x = Count, y = n_degs, color=condition.x)) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se=FALSE) +
+  theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth=0.5, color='black', fill=NA),
+        panel.grid.major.x = element_line(linewidth=0.5, color='lightgrey'),
+        panel.grid.major.y = element_line(linewidth=0.5, color='lightgrey'),
+        plot.title = element_text(hjust=0.5),
+      ) 
+
+pdf(paste0(outdir, cur_comparison, '_cell_counts_vs_nDEGs.pdf'), width=7, height=5)
+print(p)
+dev.off()
+
+cor(plot_df$n_degs, plot_df$Count)
+
+```
+
+
+test comparing across conditions 
+
+```{r eval=FALSE}
+
+bad_samples <- c('Patient 15', 'Patient 19', 'Patient 32')
+
+df <- seurat_obj@meta.data %>% subset(dataset == 'SERPENTINE') %>%
+  dplyr::select(c(Patient, Tissue)) %>% distinct()
+table(df$Tissue)
+
+df <- seurat_obj@meta.data %>% 
+  subset(dataset == 'SERPENTINE' & Primary_tumor == 'CRC' & !(Patient %in% bad_samples) & Tissue %in% c('Liver', "Lung")) %>%
+  dplyr::select(c(Patient, Tissue)) %>% distinct()
+table(df$Tissue)
+df$Patient[order(df$Patient)]
+
+
+df <- seurat_obj@meta.data %>% subset(dataset == 'SERPENTINE') %>%
+  dplyr::select(c(Patient, Timepoint)) %>% distinct()
+
+table(df$Patient)
+
+file1 <- 'results/combined/degs/Liver_vs_Lung_test_1_DEGs.csv'                            
+file2 <- 'results/combined/degs/Liver_vs_Lung_test_2_DEGs.csv'
+
+cur_cluster <- 'NKT'
+
+deg_df1 <- read.csv(file1) %>% subset(cluster == cur_cluster)
+deg_df2 <- read.csv(file2) %>% subset(cluster == cur_cluster)
+
+genes_common <- intersect(deg_df1$gene, deg_df2$gene)
+
+deg_df <- dplyr::left_join(
+  deg_df1,
+  deg_df2, 
+  by = 'gene'
+)
+
+p <- EffectComparisonPlot(
+  deg_df,
+  effect_col1 = 'log2_de.x',
+  effect_col2 = 'log2_de.y',
+  signif_col1 = 'de_fdr.x',
+  signif_col2 = 'de_fdr.y',
+  x_label = bquote("log"[2]~"(Fold Change), memento"),
+  y_label = bquote("log"[2]~"(Fold Change), FindMarkers"),
+  effect_thresh = 0
+) 
+
+pdf(paste0(fig_dir, 'test_DEGs_compare.pdf'), height=6, width=6)
+p
+dev.off()
+
+test_df <- deg_df %>% subset(
+  de_fdr.x <= 0.05 | de_fdr.y <= 0.0
+)
+
+cor(deg_df$log2_de.x, deg_df$log2_de.y)
+# [1] -0.6334341
+
+cor(test_df$log2_de.x, test_df$log2_de.y)
+# -0.7386231
+# TODO: MEMENTO DIRECTION OF EFFECT IS BACKWARDS
+
+```
+
+
+
+Test running MiloR 
+
+It seems like there's 2 ways of running Milo, the OG way or some way using something called "contrasts", which allows us to take advantage of multi-condition datasets like SERPENTINE, vs. only pairwise.
+
+Also, is it possible that we can split this into two separate rules for snakemake?
+Like there's some milo pre-processing which doesn't need to be repeated over and over again, before testing.
+
+```{r eval=FALSE}
+
+
+library(Seurat)
+library(miloR)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(tidyverse)
+
+# working config file
+config_file <- "/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/config.yml"
+config <- yaml::read_yaml(config_file)
+
+config_df <- read.table("/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/config.tsv", sep='\t', header=1)
+
+
+# load the seurat object
+if(!file.exists(config$seurat_path)){
+  stop(paste0("Path to Seurat Object specified in config file does not exist. config: ", config_file, ', seurat_path: ', config$seurat_path))
+}
+seurat_obj <- readRDS(config$seurat_path)
+
+cur_comparison <- 'Liver_vs_Lung'
+cur_comparison <- 'MSS_vs_MSI_T1_Liver'
+cur_cluster <- 'T proliferating'
+cur_test <- 'test_2'
+
+milo_setup <- config$comparisons[[cur_comparison]]$milo_setup 
+k <- milo_setup$k 
+prop <- milo_setup$prop
+reduction <- milo_setup$reduction 
+dims <- milo_setup$dims
+
+# conver the reduction to uppercase
+reduction_milo <- toupper(reduction)
+
+# get the comparisons:
+# subset the table to get the options:
+cur_config <- config_df %>% subset(
+  comparison == cur_comparison 
+)
+
+# condition info for the DEG comparison
+condition <- unique(cur_config$condition)
+g1_name <- unique(cur_config$group1)
+g2_name <- unique(cur_config$group2)
+
+group_var <- unique(cur_config$groupby)
+
+# replicate info 
+replicate_col <- unique(cur_config$replicate)  
+
+# additional subsetting:
+subset_cols <- cur_config$subset_cols[1]
+subset_groups <- cur_config$subset_groups[1]
+
+#------------------------------------------------------
+# Create the milo object
+#------------------------------------------------------
+
+# remove outlier replicates
+rep_counts <- table(seurat_obj@meta.data[,replicate_col])
+reps_remove <- names(which(rep_counts < config$min_cells_replicate))
+cur_meta <- seurat_obj@meta.data %>% subset(
+  !(get(replicate_col) %in% reps_remove)
+)
+
+# subset the seurat object based on these barcodes
+seurat_test <- seurat_obj[,rownames(cur_meta)]
+
+#------------------------------------------------------
+# TODO: Fix the meta-data columns for compliance in the 
+# design matrix. 
+#
+# For example, we can't have spaces or some other special 
+# characters in the design matrix. Like "Liver met"
+#
+# The design matrix also uses "-" as a character, so this 
+# would need to be fixed as well...
+#
+# For testing just do MSS vs. MSI since that isn't 
+# problematic
+#------------------------------------------------------
+
+#------------------------------------------------------
+# Testing a 
+#------------------------------------------------------
+
+# convert the dataset to singlecellexperiment:
+sce <- as.SingleCellExperiment(seurat_test)
+
+# convert from SCE to milo object
+milo_obj <- miloR::Milo(sce)
+
+# compute knn
+milo_obj <- miloR::buildGraph(
+  milo_obj, 
+  k = k, 
+  d = dims, 
+  reduced.dim = reduction_milo
+)
+
+# defining neighborhoods
+# TODO: Parameters??
+milo_obj <- miloR::makeNhoods(
+  milo_obj, 
+  prop = prop, 
+  k = k, 
+  d = dims, 
+  refined = TRUE, 
+  reduced_dims = reduction_milo
+)
+
+# count cells in each neighborhood 
+milo_obj <- miloR::countCells(
+    milo_obj, 
+    meta.data = as.data.frame(colData(milo_obj)), 
+    sample=replicate_col
+)
+
+# graph of neighborhoods
+milo_obj <- miloR::buildNhoodGraph(milo_obj)
+
+# SAVE THE MILO OBJECT HERE before we run the tests!!!
+
+# this doesn't really make sense in terms of snakemake
+milo_path <- gsub('.rds', '_milo.rds', config$seurat_path)
+saveRDS(milo_obj, milo_path)
+
+# re-load the milo object
+milo_obj <- readRDS(paste0('results/', cur_comparison, '/milo/', cur_comparison, '_milo.rds'))
+
+
+
+covariates <- c("Timepoint")
+meta_cols <- c(condition, covariates)
+
+tmp <- fix_metadata(
+  as.data.frame(colData(milo_obj)),
+  cols = meta_cols
+)
+
+g1_name_fix <- fix_metadata(g1_name)
+g2_name_fix <- fix_metadata(g2_name)
+
+# create the design matrix 
+design_df <- tmp[,c(replicate_col, paste0(meta_cols, '_fix'))] %>% 
+  as.data.frame() %>% 
+  dplyr::distinct()
+
+# re-name the row and column names
+colnames(design_df) <- c(replicate_col, meta_cols)
+rownames(design_df) <- design_df[,replicate_col]
+
+# set up the contrast of interest!
+cur_contrast <- paste0(paste0(condition, g1_name_fix), '-', paste0(condition, g2_name_fix))
+
+# set up the formula:
+formula <- as.formula(paste0("~ 0 + ", condition))
+
+# formula with covariates
+formula <- as.formula(paste0(c("~ 0", covariates, condition), collapse=" + "))
+
+rownames(design_df) %in% colnames(nhoodCounts(milo_obj))
+
+head(rownames(design_df))
+head(colnames(nhoodCounts(milo_obj)))
+
+da_results <- miloR::testNhoods(
+  milo_obj, 
+  design = formula, 
+  design.df = design_df, 
+  model.contrasts = cur_contrast,
+  fdr.weighting="graph-overlap", 
+  norm.method="TMM",
+  reduced.dim = reduction_milo
+)
+
+# add neighborhood annotations
+da_results <- miloR::annotateNhoods(
+  milo_obj, 
+  da_results, 
+  coldata_col = group_var
+)
+
+# determine which neighborhoods are "Mixed" with respect to the annotation based on a threshold
+da_results[,group_var] <- ifelse(da_results[,paste0(group_var, '_fraction')] <= mixed_prop, "Mixed", da_results[,group_var])
+
+# re-name:
+colnames(da_results)[(ncol(da_results)-1):ncol(da_results)] <- c('cluster', 'cluster_fraction')
+
+# add information about the specific DA test
+da_results$group1 <- g1_name 
+da_results$group2 <- g2_name 
+
+# save the DA results table!
+write.table(
+  da_results,
+  file = paste0(outdir, cur_comparison, '_milo.csv'),
+  quote=FALSE, row.names=FALSE, sep=','
+)
+
+
+#-----------------------------------------------------
+# Example1: Microsatellite With contrasts
+#
+# I don't think we need to do multiple contrasts...
+#------------------------------------------------------
+
+# test the design matrix using some column that doesn't have weird characters (spaces, etc)
+test_design <- colData(milo_obj)[,c(replicate_col, condition_fix)] %>% 
+  as.data.frame() %>%
+  dplyr::distinct()
+rownames(test_design) <- test_design$Replicate
+
+rownames(test_design) %in% colnames(nhoodCounts(milo_obj))
+
+test_design <- test_design[colnames(nhoodCounts(milo_obj)),]
+
+contrast.1 <- paste0(paste0(condition_fix, g1_name_fix), '-', paste0(condition_fix, g2_name_fix))
+
+# contrast.1 <- paste0(paste0(condition_fix, g1_name_fix), '-', paste0(condition_fix, "Primary"))
+
+
+
+# formula without any covariates:
+formula <- as.formula(paste0("~ 0 + ", condition_fix))
+
+# we need to use the ~ 0 + Variable expression here so that we have all of the levels of our variable as separate columns in our model matrix
+da_results <- testNhoods(
+  milo_obj, 
+  design = formula, 
+  design.df = test_design, 
+  model.contrasts = contrast.1,
+  fdr.weighting="graph-overlap", 
+  norm.method="TMM",
+  reduced.dim = reduction_milo
+)
+
+# TODO: add the comparison information
+
+# add neighborhood annotations
+da_results <- annotateNhoods(milo_obj, da_results, coldata_col = "lv2")
+head(da_results)
+
+da_results$lv2 <- ifelse(da_results$lv2_fraction < 0.7, "Mixed", da_results$lv2)
+
+
+
+
+
+
+#-----------------------------------------------------
+# plotting the milo results
+#------------------------------------------------------
+
+
+milo_obj <- readRDS(paste0('results/', cur_comparison, '/milo/', cur_comparison, '_milo.rds'))
+
+da_results <- read.csv(paste0('results/', cur_comparison, '/milo/', cur_comparison, '_milo_DA.csv'))
+
+
+p <- DABoxPlot(da_results) + 
+  ggtitle(paste0(g1_name, ' vs. ', g2_name))
+
+
+pdf(paste0(fig_dir, cur_comparison, '_miloR_custom.pdf'), width=8, height=8)
+print(p)
+dev.off()
+
+
+
+p <- DAReductionPlot(
+    milo_obj,
+    da_results,
+    centroids = 'lv2',
+    reduction = "X_UMAP"
+) + 
+  ggtitle(paste0(g1_name, ' vs. ', g2_name)) + 
+  coord_fixed()
+
+
+pdf(paste0(fig_dir, cur_comparison, '_miloR_reduction_custom.pdf'), width=10, height=10)
+print(p)
+dev.off()
+
+#------------------------------------------------------
+# TODO:
+# Write an example with covariates
+#------------------------------------------------------
+
+
+# centroids:
+centroids <- 'lv2'
+reduction_df <- as.data.frame(reducedDims(milo_obj)[[reduction]])
+colnames(reduction_df) <- c('x_coord', 'y_coord')
+reduction_df$cluster <- as.character(colData(milo_obj)[,centroids])
+
+centroid_df <- reduction_df %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::summarise(x_coord = mean(x_coord), y_coord = mean(y_coord))
+
+
+
+write.csv(da_results, file=paste0(data_dir, 'milo_da_results_', cur_milo_file,'.csv'))
+
+
+#-------------------------------------------------------#
+# Making a basic proportion plot
+#-------------------------------------------------------#
+
+
+p <- ProportionBarPlot(
+  milo_obj,
+  group_var,
+  condition,
+  g1_name,
+  g2_name,
+  replicate_col = replicate_col,
+  reps_remove = reps_remove,
+  subset_groups = subset_groups,
+  subset_cols = subset_cols
+)
+
+
+pdf(paste0(fig_dir, 'cluster_proportion_Tissue_scaled_func.pdf'), height=4, width=10)
+print(p)
+dev.off()
+
+
+
+
+
+```
+
+
+

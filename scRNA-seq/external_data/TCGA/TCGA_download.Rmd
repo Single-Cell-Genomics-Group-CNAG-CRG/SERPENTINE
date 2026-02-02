@@ -1,0 +1,50 @@
+
+conda activate mpa
+
+useful links:
+
+https://bioconductor.org/packages/release/bioc/vignettes/TCGAbiolinks/inst/doc/index.html
+
+https://rpubs.com/tiagochst/TCGAworkshop
+
+This section does take a long time to run so be patient.
+
+```{r eval=FALSE}
+
+# set the project directory 
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/external_data/TCGA/')
+data_dir <- 'data/'
+fig_dir <- 'figures/'
+
+
+#BiocManager::install("TCGAbiolinks")
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(tidyverse)
+
+projects <- c("TCGA-COAD", "TCGA-READ", "TCGA-UCEC")
+
+query_rnaseq <- TCGAbiolinks::GDCquery(
+  project = projects,
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+
+GDCdownload(query_rnaseq)
+rna_data <- GDCprepare(query_rnaseq)
+
+dim(rna_data)
+# 60,660 features and 1290 samples
+
+saveRDS(rna_data, file=paste0(data_dir, 'TCGA_summarizedExperiment_unprocessed.rds'))
+
+
+# Query clinical data for TCGA-COAD and TCGA-READ
+clin_coad <- GDCquery_clinic(project = "TCGA-COAD", type = "clinical")
+clin_read <- GDCquery_clinic(project = "TCGA-READ", type = "clinical")
+
+clin <- rbind(clin_coad, clin_read)
+
+```

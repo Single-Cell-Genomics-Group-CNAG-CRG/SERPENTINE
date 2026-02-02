@@ -1,0 +1,184 @@
+
+```{bash eval=FALSE}
+
+# request interactive node
+# 8 threads, 256G mem, 10 hours
+interactive 8 256G 10:00:00 genD
+
+# activate conda env
+conda activate mpa
+R
+```
+
+```{r eval=FALSE}
+
+
+library(Seurat) # packageVersion 5.1.0
+library(Matrix)
+library(tidyverse)
+library(cowplot)
+library(patchwork)
+library(arrow)
+library(dittoSeq)
+library(hdWGCNA)
+theme_set(theme_cowplot())
+
+# define the cell type of interest
+cur_celltype <- 'Myeloid'
+
+# set the project directory 
+setwd(paste0('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/'))
+data_dir <- 'data/'
+fig_dir <- '/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/figures/progress_report/'
+
+source("/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/scripts/plotting/plotting_functions.R")
+
+
+```
+
+Myeloid compartment
+
+```{r eval=FALSE}
+
+cur_celltype <- 'Myeloid'
+
+# re-load the object
+seurat_obj <- readRDS(file=paste0("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/", cur_celltype, "/data/", cur_celltype, "_integrated_annotated_seurat.rds"))
+
+#----------------------------------------------------------#
+#  UMAP plot
+#----------------------------------------------------------#
+`
+color_df <- data.frame(
+    group = levels(seurat_obj$annotation),
+    colour = dittoColors()[1:length(levels(seurat_obj$annotation))]
+)`
+
+p <- PlotEmbedding(
+    seurat_obj,
+    group.by = 'annotation',
+    #split.by = 'hdWGCNA_selected',
+    reduction = 'X_umap',
+    plot_theme = umap_theme(),
+    raster = TRUE,
+    raster_dpi = 300,
+    raster_scale = 0.5,
+    label = TRUE,
+    plot_ratio = TRUE,
+    color_df = color_df,
+    point_size = 0.5,
+   # legend_point_size = opts$legend_point_size,
+    # text_size = opts$text_size,
+) + ggtitle("Myeloid compartment")
+
+pdf(paste0(fig_dir, cur_celltype, '_UMAP_annotation.pdf'), width=8, height=6)
+print(p)
+dev.off()
+
+```
+
+
+Tumor/epithelial cell compartment
+
+```{r eval=FALSE}
+
+cur_celltype <- 'TumorEpi'
+
+# re-load the object
+seurat_obj <- readRDS(file=paste0("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/", cur_celltype, "/data/", cur_celltype, "_integrated_annotated_seurat.rds"))
+
+
+#----------------------------------------------------------#
+#  UMAP plot
+#----------------------------------------------------------#
+
+color_df <- data.frame(
+    group = unique(seurat_obj$leiden_1),
+    colour = dittoColors()[1:length(unique(seurat_obj$leiden_1))]
+)
+
+p <- PlotEmbedding(
+    seurat_obj,
+    group.by = 'leiden_1',
+    reduction = 'X_umap',
+    plot_theme = umap_theme(),
+    raster = TRUE,
+    raster_dpi = 300,
+    raster_scale = 0.5,
+    label = TRUE,
+    plot_ratio = FALSE,
+    color_df = color_df,
+    point_size = 0.5,
+   # legend_point_size = opts$legend_point_size,
+    # text_size = opts$text_size,
+) + ggtitle("Tumor cell compartment")
+
+pdf(paste0(fig_dir, cur_celltype, '_UMAP_annotation.pdf'), width=8, height=6)
+print(p)
+dev.off()
+
+```
+
+
+T cell compartment
+
+```{r eval=FALSE}
+
+cur_celltype <- 'Tcells'
+
+# re-load the object
+seurat_obj <- readRDS(file=paste0("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/", cur_celltype, "/data/", cur_celltype, "_integrated_annotated_seurat.rds"))
+
+#----------------------------------------------------------#
+# Set the factor levels for the annotations
+#----------------------------------------------------------#
+
+seurat_obj$annotation <- factor(
+    as.character(seurat_obj$annotation),
+    levels = c(
+        'Classical monocyte',
+        'Non-classical monocyte',
+        'Mono3',
+        'Mac resident CCL18pos',
+        'Mac resident FOLR2pos',
+        'Angio TAMs',
+        'Inflammatory TAMs',
+        'LA TAMs',
+        'TAMs PDL1pos',
+        'Kuppfer-like TAMs',
+        'Metabolic mac LAMs',
+        'MT-RTAMs-like',
+        'DC', 'DC1', 'DC2', 'DC5', 'mREGs DCs', 'pDCs'
+    )
+)
+
+#----------------------------------------------------------#
+#  UMAP plot
+#----------------------------------------------------------#
+
+color_df <- data.frame(
+    group = unique(seurat_obj$annotation),
+    colour = dittoColors()[1:length(unique(seurat_obj$annotation))]
+)
+
+p <- PlotEmbedding(
+    seurat_obj,
+    group.by = 'annotation',
+    reduction = 'X_umap',
+    plot_theme = umap_theme(),
+    raster = TRUE,
+    raster_dpi = 300,
+    raster_scale = 0.5,
+    label = TRUE,
+    plot_ratio = TRUE,
+    color_df = color_df,
+    point_size = 0.5,
+   # legend_point_size = opts$legend_point_size,
+    # text_size = opts$text_size,
+) + ggtitle("T-cell compartment")
+
+pdf(paste0(fig_dir, cur_celltype, '_UMAP_annotation.pdf'), width=12, height=8)
+print(p)
+dev.off()
+
+```

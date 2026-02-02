@@ -1,0 +1,395 @@
+# launch an interactive node
+interactive 8 256G 12:00:00 genD
+
+# to launch:
+module load GCC
+conda activate compact
+
+
+```{r eval=FALSE}
+
+# input handling packages
+library(yaml)
+library(assertthat)
+
+# data wrangling & plotting packages
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+library(crayon)
+
+# single-cell & data analysis packages
+library(Seurat)
+library(Matrix)
+
+# network analysis
+library(WGCNA)
+library(hdWGCNA)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+library(limma)
+
+# set the plotting theme
+theme_set(theme_cowplot())
+
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/systems-wide/')
+
+# source helper functions
+source("../hdWGCNA/Tcells/scripts/helper_functions.R")
+source("../hdWGCNA/Tcells/scripts/plotting_functions.R")
+source("../hdWGCNA/Tcells/scripts/pseudobulk_functions.R")
+
+
+
+```
+
+Set up the T-cell pseudobulk object 
+
+```{r eval=FALSE}
+
+# load the configuration file:
+project_dir <- "/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/hdWGCNA/Tcells/"
+config_file <- paste0(project_dir, "/config.yml")
+config <- yaml::read_yaml(config_file)
+gen_opts <- config$general
+results_dir <- paste0(project_dir, '/', gen_opts$out_dir)
+networks <- names(config$networks)
+
+fig_dir <- 'figures/'
+data_dir <- 'data/'
+
+# load the full Seurat object
+seurat_obj <- readRDS(config$seurat_path)
+
+networks <- c("Liver_T1", "Liver_T2", "Lung_T1", "Lung_T2", "Primary_T1", "Primary_T2")
+
+# load the individual seurat objects from each network analysis
+seurat_list <- lapply(networks, function(wgcna_name){
+    print(wgcna_name)
+    cur_obj <- readRDS(paste0(results_dir, '/', wgcna_name, '/', gen_opts$data_dir, '/', wgcna_name, '_hdWGCNA.rds'))
+    cur_obj
+})
+names(seurat_list) <- networks
+
+#---------------------------------------------------------#
+# Get the table of co-expression modules 
+#---------------------------------------------------------#
+
+# get table of modules from the individual hdWGCNA networks 
+modules <- do.call(rbind, lapply(networks, function(cur_net){
+    cur_obj <- SetActiveWGCNA(seurat_list[[cur_net]], wgcna_name = cur_net)
+    cur_modules <- GetHubGenes(cur_obj, n_hubs = Inf) %>%
+        dplyr::rename(weight = kME)
+    rownames(cur_modules) <- 1:nrow(cur_modules)
+    cur_modules$network <- cur_net 
+    cur_modules$lineage <- 'Tcells'
+    cur_modules
+}))
+table(modules$module)
+modules_tcells <- modules
+
+#---------------------------------------------------------#
+# Construct the pseudo-bulk object
+#---------------------------------------------------------#
+
+seurat_obj$Patient_Timepoint <- paste0(seurat_obj$Patient, ':T', seurat_obj$Timepoint)
+table(seurat_obj$Patient_Timepoint)
+
+# extract the counts matrix & cell-level meta-data from the Seurat object
+X <- GetAssayData(seurat_obj, layer='counts')
+meta <- seurat_obj@meta.data
+
+# create a pseudo-bulk SummarizedExperiment object
+se <- AggregatePseudobulk(
+    X, meta, 
+    replicate_col = "Patient_Timepoint", 
+    group_col = "Patient_Timepoint",
+    min_cells = 75
+)
+
+
+# select groups of interest
+se <- se[,
+    (colData(se)$Tissue %in% c('Liver', 'Lung')) &
+    (colData(se)$Timepoint %in% c(1,2)) &
+    (colData(se)$Primary_tumor == 'CRC')
+]
+
+# exclude patients that don't have both timepoints
+patients_keep <- intersect(
+    colData(se) %>% subset(Timepoint == 1) %>% .$Patient %>% unique,
+    colData(se) %>% subset(Timepoint == 2) %>% .$Patient %>% unique
+)
+
+se <- se[, colData(se)$Patient %in% patients_keep]
+table(colData(se)$Tissue, colData(se)$Timepoint)
+
+
+# Remove genes with zero variance
+X_pb <- assays(se)$counts
+good_genes <- names(which(apply(X_pb, 1, sd) != 0))
+se <- se[good_genes,]
+
+# normalize the pseudobulk SummarizedExperiment
+se <- NormalizeCounts(
+    se, 
+    method = 'VST',
+    assay_name = 'counts'
+)
+
+#---------------------------------------------------------#
+# Calculate pseudobulk MEs and decoupleR scores:
+#---------------------------------------------------------#
+
+# calculate MEs for each of these modules
+se_modules <- PseudobulkModuleEigengenes(
+    se, 
+    modules = modules,
+    assay_name = "VST",
+    new_assay_name = "MEs"
+)
+
+library(decoupleR)
+
+# define the expression matrix to use
+X <- assays(se)$VST
+
+signature_df <- data.frame()
+for(cur_net in unique(modules$network)){
+
+  print(cur_net)
+  cur_df <- subset(modules, network == cur_net) %>%
+    dplyr::select(gene_name, module, weight) %>%
+    mutate(module = droplevels(module))
+
+  cur_signature_df <- decoupleR::run_ulm(
+    mat = X,
+    net = cur_df,
+    .source = 'module',
+    .target = 'gene_name',
+    .mor = 'weight'
+  )
+
+  cur_signature_df$network <- cur_net
+  signature_df <- rbind(signature_df, cur_signature_df)
+
+}
+
+# cast from long to wide:
+signature_mat <- signature_df %>% 
+    dplyr::select(source, condition, score) %>%
+    tidyr::pivot_wider(
+        names_from = condition,
+        values_from = score,
+        values_fill = 0
+    ) %>%
+    as.data.frame()
+rownames(signature_mat) <- signature_mat$source
+signature_mat <- as.matrix(signature_mat[,-1])
+
+# re-order to match the se_modules object
+signature_mat <- signature_mat[rownames(se_modules), colnames(se_modules)]
+
+# add to the se_modules object
+assays(se_modules)$decoupleR_ULM <- signature_mat
+
+#---------------------------------------------------------#
+# Create a MultiAssayExperiment (MAE) object 
+# and save the results
+#---------------------------------------------------------#
+
+mae <- MultiAssayExperiment(
+    experiments = list(
+        RNA = se,
+        modules = se_modules
+    ),
+    colData = colData(se)
+)
+
+mae_tcells <- mae 
+
+```
+
+Set up the Tumor pseudobulk object:
+
+```{r eval=FALSE}
+
+
+# load the configuration file:
+project_dir <- "/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/hdWGCNA/TumorEpi/"
+config_file <- paste0(project_dir, "/config.yml")
+config <- yaml::read_yaml(config_file)
+gen_opts <- config$general
+results_dir <- paste0(project_dir, '/', gen_opts$out_dir)
+networks <- names(config$networks)
+
+fig_dir <- 'figures/'
+data_dir <- 'data/'
+
+# load the full Seurat object
+seurat_obj <- readRDS(config$seurat_path)
+
+networks <- c("Liver_T1", "Liver_T2", "Lung_T1", "Lung_T2", "Primary_T1", "Primary_T2")
+
+# load the individual seurat objects from each network analysis
+seurat_list <- lapply(networks, function(wgcna_name){
+    print(wgcna_name)
+    cur_obj <- readRDS(paste0(results_dir, '/', wgcna_name, '/', gen_opts$data_dir, '/', wgcna_name, '_hdWGCNA.rds'))
+    cur_obj
+})
+names(seurat_list) <- networks
+
+#---------------------------------------------------------#
+# Get the table of co-expression modules 
+#---------------------------------------------------------#
+
+# get table of modules from the individual hdWGCNA networks 
+modules <- do.call(rbind, lapply(networks, function(cur_net){
+    cur_obj <- SetActiveWGCNA(seurat_list[[cur_net]], wgcna_name = cur_net)
+    cur_modules <- GetHubGenes(cur_obj, n_hubs = Inf) %>%
+        dplyr::rename(weight = kME)
+    rownames(cur_modules) <- 1:nrow(cur_modules)
+    cur_modules$network <- cur_net 
+    cur_modules$lineage <- 'TumorEpi'
+    cur_modules
+}))
+table(modules$module)
+modules_tumor <- modules
+
+#---------------------------------------------------------#
+# Construct the pseudo-bulk object
+#---------------------------------------------------------#
+
+seurat_obj$Patient_Timepoint <- paste0(seurat_obj$Patient, ':T', seurat_obj$Timepoint)
+table(seurat_obj$Patient_Timepoint)
+
+# extract the counts matrix & cell-level meta-data from the Seurat object
+X <- GetAssayData(seurat_obj, layer='counts')
+meta <- seurat_obj@meta.data
+
+# create a pseudo-bulk SummarizedExperiment object
+se <- AggregatePseudobulk(
+    X, meta, 
+    replicate_col = "Patient_Timepoint", 
+    group_col = "Patient_Timepoint",
+    min_cells = 75
+)
+
+
+# select groups of interest
+se <- se[,
+    (colData(se)$Tissue %in% c('Liver', 'Lung')) &
+    (colData(se)$Timepoint %in% c(1,2)) &
+    (colData(se)$Primary_tumor == 'CRC')
+]
+
+# exclude patients that don't have both timepoints
+patients_keep <- intersect(
+    colData(se) %>% subset(Timepoint == 1) %>% .$Patient %>% unique,
+    colData(se) %>% subset(Timepoint == 2) %>% .$Patient %>% unique
+)
+
+se <- se[, colData(se)$Patient %in% patients_keep]
+table(colData(se)$Tissue, colData(se)$Timepoint)
+
+
+# Remove genes with zero variance
+X_pb <- assays(se)$counts
+good_genes <- names(which(apply(X_pb, 1, sd) != 0))
+se <- se[good_genes,]
+
+# normalize the pseudobulk SummarizedExperiment
+se <- NormalizeCounts(
+    se, 
+    method = 'VST',
+    assay_name = 'counts'
+)
+
+#---------------------------------------------------------#
+# Calculate pseudobulk MEs and decoupleR scores:
+#---------------------------------------------------------#
+
+# calculate MEs for each of these modules
+se_modules <- PseudobulkModuleEigengenes(
+    se, 
+    modules = modules,
+    assay_name = "VST",
+    new_assay_name = "MEs"
+)
+
+library(decoupleR)
+
+# define the expression matrix to use
+X <- assays(se)$VST
+
+signature_df <- data.frame()
+for(cur_net in unique(modules$network)){
+
+  print(cur_net)
+  cur_df <- subset(modules, network == cur_net) %>%
+    dplyr::select(gene_name, module, weight) %>%
+    mutate(module = droplevels(module))
+
+  cur_signature_df <- decoupleR::run_ulm(
+    mat = X,
+    net = cur_df,
+    .source = 'module',
+    .target = 'gene_name',
+    .mor = 'weight'
+  )
+
+  cur_signature_df$network <- cur_net
+  signature_df <- rbind(signature_df, cur_signature_df)
+
+}
+
+# cast from long to wide:
+signature_mat <- signature_df %>% 
+    dplyr::select(source, condition, score) %>%
+    tidyr::pivot_wider(
+        names_from = condition,
+        values_from = score,
+        values_fill = 0
+    ) %>%
+    as.data.frame()
+rownames(signature_mat) <- signature_mat$source
+signature_mat <- as.matrix(signature_mat[,-1])
+
+# re-order to match the se_modules object
+signature_mat <- signature_mat[rownames(se_modules), colnames(se_modules)]
+
+# add to the se_modules object
+assays(se_modules)$decoupleR_ULM <- signature_mat
+
+#---------------------------------------------------------#
+# Create a MultiAssayExperiment (MAE) object 
+# and save the results
+#---------------------------------------------------------#
+
+mae <- MultiAssayExperiment(
+    experiments = list(
+        RNA = se,
+        modules = se_modules
+    ),
+    colData = colData(se)
+)
+mae_tumor <- mae 
+
+```
+
+Time to slice and dice matrices 
+
+```{r eval=FALSE}
+
+assay_use <- 'decoupleR_ULM'
+
+
+MEs_tcells <- assays(experiments(mae_tcells)$modules)[[assay_use]]
+
+
+```

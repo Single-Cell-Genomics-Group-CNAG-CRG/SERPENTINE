@@ -1,0 +1,240 @@
+# launch an interactive node
+interactive 8 256G 12:00:00 genD
+
+# to launch:
+module load GCC
+conda activate mpa
+
+
+```{r eval=FALSE}
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(stringi)
+library(RColorBrewer)
+library(MetBrewer)
+theme_set(theme_cowplot())
+
+# set the project directory 
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/')
+data_dir <- 'data/'
+fig_dir <- 'figures/'
+
+# load the patient attribute table
+patient_df <- read.table(paste0(data_dir, 'SERPENTINE_patient_metadata_July2025.txt'), sep='\t', fileEncoding = 'utf-16', header=TRUE)
+
+
+patient_df$Patient <- stri_trans_general(patient_df$Patient, 'NFC')
+patient_df$Patient <- stri_trim_both(patient_df$Patient)
+patient_df$Patient <- stri_replace_all_regex(patient_df$Patient, "\\p{C}", "")
+patient_df$Patient <- stri_replace_all_fixed(patient_df$Patient, "\u00A0", " ")
+
+
+patient_df$Primary_tumor <- stri_trans_general(patient_df$Primary_tumor, 'NFC')
+patient_df$Primary_tumor <- stri_trim_both(patient_df$Primary_tumor)
+patient_df$Primary_tumor <- stri_replace_all_regex(patient_df$Primary_tumor, "\\p{C}", "")
+patient_df$Primary_tumor <- stri_replace_all_fixed(patient_df$Primary_tumor, "\u00A0", " ")
+
+# load the scRNA sequencing library table  
+library_df <- read.table(paste0(data_dir, 'SERPENTINE_metadata_July2025.txt'), sep='\t', header=TRUE) %>% dplyr::rename(Patient = Sample)
+
+
+# make sure Patient exists in library_df, then convert numeric -> "Patient 01" format
+if(!"Patient" %in% colnames(library_df)) stop("library_df has no 'Patient' column")
+
+library_df <- library_df %>%
+    dplyr::mutate(
+        Patient = as.numeric(Patient),                    # coerce numeric-like values
+        Patient = sprintf("Patient %02d", Patient)        # format as "Patient 01", "Patient 02", ...
+    )
+
+# trim/normalize just in case
+library_df$Patient <- stri_trim_both(library_df$Patient)
+patient_df$Patient <- stri_trim_both(patient_df$Patient)
+
+# join the tables by Patient (keeps all patient_df rows)
+patient_merged <- patient_df %>%
+    dplyr::left_join(library_df, by = "Patient")
+
+# simple sanity checks
+missing_in_patient <- setdiff(unique(library_df$Patient), unique(patient_df$Patient))
+missing_in_library <- setdiff(unique(patient_df$Patient), unique(library_df$Patient))
+if(length(missing_in_patient) > 0) message("Patients in library_df not found in patient_df: ", paste(missing_in_patient, collapse = ", "))
+if(length(missing_in_library) > 0) message("Patients in patient_df not found in library_df: ", paste(head(missing_in_library, 10), collapse = ", "))
+
+patient_df <- patient_merged
+
+
+# simplify timepoint to "Pre" and "Post"
+patient_df$Timepoint_simple <- ifelse(patient_df$Timepoint > 1, "Post", "Pre")
+
+# fix microsatellite status:
+patient_df$Microsatellite_status <- ifelse(grepl("MSS", patient_df$Microsatellite_status), "MSS", "MSI")
+
+# fix response category
+patient_df$Response <- ifelse(grepl("Progression", patient_df$Response), "Disease progression", patient_df$Response)
+table(patient_df$Response)
+
+# add "Other" category for the Tissue
+patient_df$Tissue <- ifelse(patient_df$Tissue %in% c("Liver", "Lung", "Lymph node"), patient_df$Tissue, "Other")
+
+```
+
+
+compare response ratio between Liver and Lung (box and whisker plots)
+
+
+
+```{r eval=FALSE}
+
+plot_df <- patient_df %>%
+    subset(
+        (Tissue %in% c("Liver", "Lung")) & 
+        (Timepoint %in% c(1, 2)) &
+        (Primary_tumor == "CRC") &
+        (Patient != 'Patient 26')
+    ) %>%
+    dplyr::select(c(Patient, Microsatellite_status, Tissue, Response_ratio)) %>%
+    distinct()
+
+# remove patient 26
+
+plot_df
+
+
+tissue_colors <- paste0(met.brewer("Egypt", n=4))
+names(tissue_colors) <- unique(patient_df$Tissue)
+p <- plot_df %>%
+    ggplot(aes(x=Tissue, y=Response_ratio)) + 
+    geom_boxplot(aes(fill=Tissue), outlier.shape=NA, width=0.5) +
+    ggbeeswarm::geom_quasirandom(
+        aes(shape = Microsatellite_status), width=0.5, size=2
+    ) + 
+    ggpubr::stat_compare_means(method = 'wilcox') + 
+    scale_fill_manual(values = tissue_colors)
+
+pdf(paste0(fig_dir, 'liver_vs_lung_response_ratio.pdf'), width=4.5, height=4)
+print(p)
+dev.off()
+
+
+
+```
+
+Start making the plot 
+
+```{r eval=FALSE}
+
+
+row_theme <- theme(
+    axis.title.y = element_blank(),
+    axis.line.y = element_blank(),
+    axis.line.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank(),
+    plot.margin = margin(c(0,0,0,0))
+)   
+
+row_theme_last <- theme(
+    axis.title.y = element_blank(),
+    axis.line.y = element_blank(),
+    axis.line.x = element_blank(),
+    axis.title.x = element_blank(),
+    plot.margin = margin(c(0,0,0,0))
+) 
+
+plot_list <- list() 
+
+primary_colors <- c('lightcoral', 'white')
+names(primary_colors) <- c("CRC", "Endometrial")
+plot_list[["Primary"]] <- patient_df %>%
+    ggplot(aes(x=Patient, y="Primary Tumor", fill = Primary_tumor)) + 
+    geom_tile(color='black') + 
+    scale_fill_manual(values = primary_colors) +
+    coord_equal() + 
+    scale_x_discrete(labels = function(x) gsub("Patient ", "", x)) +
+    row_theme_last
+
+
+# plot 1: Microsatellite Status 
+micro_colors <- c("orchid", "White")
+names(micro_colors) <- c("MSS", "MSI")
+plot_list[['Microsatellite']]  <- patient_df %>% 
+    dplyr::select(c(Patient, Microsatellite_status)) %>% dplyr::distinct() %>%
+    ggplot(aes(x = Patient, y='Microsatellite', fill = Microsatellite_status)) +
+    geom_tile(color='black') + 
+    coord_equal() + 
+    scale_fill_manual(values = micro_colors) +
+    row_theme
+
+
+# plot 3: Response
+
+response_colors <- c('grey', 'darkorange2', 'white', 'royalblue')
+names(response_colors) <- c('Not evaluated', 'Disease progression', 'Stable disease', 'Partial response')
+plot_list[['Response']]  <- patient_df %>% 
+    ggplot(aes(x = Patient, y='Response', fill = Response)) +
+    scale_fill_manual(values=response_colors) +
+    geom_tile(color='black') + 
+    coord_equal() + row_theme
+
+
+# Age (placeholder)
+plot_list[['Age']]  <- patient_df %>%
+    ggplot(aes(x = Patient, y='Age', fill = Age)) +
+    geom_tile(color='black') + 
+    scale_fill_continuous(low = 'whitesmoke', high = 'seagreen') +
+  coord_equal() + 
+    row_theme 
+
+# Sex (placeholder)
+sex_colors <- c('grey', 'pink', 'dodgerblue')
+names(sex_colors) <- c("Missing", "Female", "Male")
+plot_list[['Sex']]  <- patient_df %>%
+    ggplot(aes(x = Patient, y='Sex', fill = Sex)) +
+    geom_tile(color='black') +
+    scale_fill_manual(values = sex_colors) + 
+   coord_equal() + 
+    row_theme 
+
+tissue_colors <- paste0(met.brewer("Egypt", n=4))
+names(tissue_colors) <- unique(patient_df$Tissue)
+tissue_colors["Other"] <- "white"
+plot_list[['Timepoint']]  <- patient_df %>% 
+    ggplot(aes(x = Patient, y=Timepoint_simple, fill = Tissue)) +
+    geom_tile(color='black') + 
+    scale_fill_manual(values = tissue_colors) +
+    coord_equal() + 
+    row_theme
+
+plot_list[['Response_ratio']]  <- patient_df %>%
+    ggplot(aes(x = Patient, y='Response_ratio', fill = Response_ratio)) +
+    geom_tile(color='black') + 
+    scale_fill_gradient2(high = 'darkorange3', low='navy', mid='whitesmoke', midpoint=0, limits = c(-100, 100), oob = scales::squish) +
+  coord_equal() + 
+    row_theme 
+
+plot_list[['N_pre_lines']]  <- patient_df %>%
+    ggplot(aes(x = Patient, y='N previous lines', fill = as.numeric(N.pre.lines.))) +
+    geom_tile(color='black') + 
+  coord_equal() + 
+    row_theme 
+
+patch <- (
+    plot_list[['Timepoint']] /
+    plot_list[['Response_ratio']] /
+    plot_list[['Response']] /
+   # plot_list[['N_pre_lines']] /
+    plot_list[['Age']] /
+    plot_list[['Sex']] /
+    plot_list[['Microsatellite']] /
+    plot_list[["Primary"]]
+) + plot_layout(guides='collect')
+
+pdf(paste0(fig_dir, 'test_patient_matrix3.pdf'), width=11, height=11)
+print(patch)
+dev.off()
+
+
+```

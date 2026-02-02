@@ -1,0 +1,581 @@
+interactive 8 256G 12:00:00 genD
+
+module load GCC
+conda activate compact
+
+```{r eval=FALSE}
+
+# input handling packages
+library(yaml)
+library(assertthat)
+
+# data wrangling & plotting packages
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+library(crayon)
+
+# single-cell & data analysis packages
+library(Seurat)
+library(Matrix)
+
+# network analysis
+library(WGCNA)
+library(hdWGCNA)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+enableWGCNAThreads(nThreads = 8)
+
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+library(limma)
+
+# set the plotting theme
+theme_set(theme_cowplot())
+
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/hdWGCNA/Tcells/')
+
+# source helper functions
+source("scripts/helper_functions.R")
+source("scripts/plotting_functions.R")
+source("scripts/pseudobulk_functions.R")
+
+# load the configuration file:
+config_file <- "config.yml"
+config <- yaml::read_yaml(config_file)
+gen_opts <- config$general
+
+fig_dir <- 'figures/'
+data_dir <- 'data/'
+
+# load the full Seurat object
+seurat_obj <- readRDS(config$seurat_path)
+
+networks <- c("Liver_T1", "Liver_T2", "Lung_T1", "Lung_T2", "Primary_T1", "Primary_T2")
+
+# load the individual seurat objects from each network analysis
+seurat_list <- lapply(networks, function(wgcna_name){
+    print(wgcna_name)
+    cur_obj <- readRDS(paste0(gen_opts$out_dir, '/', wgcna_name, '/', gen_opts$data_dir, '/', wgcna_name, '_hdWGCNA.rds'))
+
+    # update the TOM path
+    cur_net <- GetNetworkData(cur_obj)
+    cur_net$TOMFiles <- paste0(
+        "/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/hdWGCNA/Tcells/results/", wgcna_name, "/TOM/", wgcna_name,"_TOM.rda"
+    )
+    cur_obj <- SetNetworkData(cur_obj, cur_net)
+
+    cur_obj
+})
+names(seurat_list) <- networks
+
+```
+
+
+Define helper functions
+```{r eval=FALSE}
+
+
+classify_preservation <- function(p_row, threshold = 0.05) {
+  # 1. Count total significant metrics
+  sig_count <- sum(p_row < threshold)
+  
+  # 2. Check for "Essential" metrics (Density & Coherence)
+  # These are often considered the most critical for core module structure
+  essentials_sig <- p_row["coherence"] < threshold & p_row["avg.weight"] < threshold
+  
+  # 3. Logic for categorization
+  if (sig_count == length(p_row)) {
+    return("Strong")
+  } else if (sig_count >= 4 & essentials_sig) {
+    return("Moderate")
+  } else if (sig_count >= 1) {
+    return("Weak")
+  } else {
+    return("None")
+  }
+}
+
+```
+
+Run NetRep module eigengenes 
+
+1. Use the Pseudobulk dataset for expression ...? 
+2. Use the respective TOMs 
+3. Create a correlation matrix from the PB data 
+
+```{r eval=FALSE}
+
+comparisons <- list(
+    "Liver" = c("Liver_T1", "Liver_T2"),
+    "Lung" = c("Lung_T1", "Lung_T2")
+    #"Primary" = c("Primary_T1", "Primary_T2")
+)
+
+mae <- readRDS(paste0(data_dir, "Tcells_pseudobulk_MAE.rds"))
+
+preservation_list <- list()
+for(cur_comparison in names(comparisons)){
+    for(i in 1:2){
+        
+        # get the reference and the query networks:
+        ref <- comparisons[[cur_comparison]][i]
+        query <- comparisons[[cur_comparison]][-i] 
+        cur_name <- paste0(ref, '|', query)
+        print(cur_name)
+
+        ref_obj <- seurat_list[[ref]]
+        query_obj <- seurat_list[[query]]
+
+        # get the tissue and timepoint names:
+        cur_tissue <- unique(ref_obj$Tissue)
+        ref_tp <- unique(ref_obj$Timepoint)
+        query_tp <- unique(query_obj$Timepoint)
+
+        # load the topological overlap matrices:
+        TOM1 <- GetTOM(ref_obj)
+        TOM2 <- GetTOM(query_obj)
+
+        # get the modules from the reference dataset
+        modules <- GetModules(ref_obj) %>% 
+            subset(module != 'grey')
+
+        # get the list of genes to use for the comparison
+        genes_use <- intersect(modules$gene_name, colnames(TOM2))
+        modules <- modules %>% subset(gene_name %in% genes_use)
+
+        all.equal(genes_use, modules$gene_name)
+        module_labels <- as.character(modules$module)
+        names(module_labels) <- modules$gene_name
+
+        # get the pseudobulk expression matrix, split by Liver TP1 and TP2:
+        X <- t(assays(experiments(mae)$RNA)$VST)[,genes_use]
+        X1 <- X[(colData(mae)$Tissue == cur_tissue & colData(mae)$Timepoint == ref_tp),]
+        X2 <- X[(colData(mae)$Tissue == cur_tissue & colData(mae)$Timepoint == query_tp),]
+        
+        # calcualte correlation matrices:
+        cor_mat1 <- cor(X1)
+        cor_mat2 <- cor(X2)
+
+        # only keep genes that are in these modules
+        TOM1 <- TOM1[genes_use, genes_use]
+        TOM2 <- TOM2[genes_use, genes_use]
+        cor_mat1 <- cor_mat1[genes_use,genes_use]
+        cor_mat2 <- cor_mat2[genes_use,genes_use]
+
+        # set up data lists:
+        n_list <- list(TOM1, TOM2)
+        d_list <- list(X1, X2)
+        c_list <- list(cor_mat1, cor_mat2)
+        names(n_list) <- c('ref', 'query')
+        names(d_list) <- c('ref', 'query')
+        names(c_list) <- c('ref', 'query')
+
+        # Assess the preservation of modules in the test dataset.
+        preservation_test <- NetRep::modulePreservation(
+            network=n_list, 
+            data=d_list, 
+            correlation=c_list, 
+            moduleAssignments=module_labels, discovery="ref", test="query", 
+            nPerm=2500, nThreads=8
+        )
+
+        p_mat <- preservation_test$p.values
+
+        preservation_results <- data.frame(
+            Module = rownames(p_mat),
+            Sig_Count = apply(p_mat, 1, function(x) sum(x < 0.05)),
+            Status = apply(p_mat, 1, classify_preservation)
+        )
+        preservation_results$Status <- factor(
+            preservation_results$Status, 
+            levels = c("None", "Weak", "Moderate", "Strong")
+        )
+       # preservation_test[["status"]] <- preservation_results
+
+        # Assuming 'preservation1' is your NetRep result object
+        obs <- preservation_test$observed  # Matrix: modules x stats
+        nul <- preservation_test$nulls     # Array: modules x stats x permutations
+
+        # 1. Calculate the mean and SD across the 3rd dimension (permutations)
+        null_means <- apply(nul, c(1, 2), mean, na.rm = TRUE)
+        null_sds   <- apply(nul, c(1, 2), sd, na.rm = TRUE)
+
+        # 2. Calculate Z-scores: (Observed - Null Mean) / Null SD
+        z_scores <- (obs - null_means) / null_sds
+
+        # 3. Handle cases where SD is 0 (prevents Inf/NaN)
+        z_scores[null_sds == 0] <- 0
+
+        # 4. Create a "Z-summary" (the average Z-score across all 7 metrics)
+        z_summary_df <- data.frame(
+            Module = rownames(z_scores),
+            Z_summary = rowMeans(z_scores, na.rm = TRUE)
+        )
+        z_summary_df <- cbind(z_summary_df, preservation_results)
+        colnames(z_scores) <- paste0("Z_", colnames(z_scores))
+        z_summary_df <- cbind(z_summary_df, z_scores)
+
+
+        preservation_test[["summary"]] <- z_summary_df
+        preservation_list[[cur_name]] <- preservation_test
+
+    }
+}
+
+
+for(cur_comparison in names(comparisons)){
+    for(i in 1:2){
+        
+        # get the reference and the query networks:
+        ref <- comparisons[[cur_comparison]][i]
+        query <- comparisons[[cur_comparison]][-i] 
+        cur_name <- paste0(ref, '|', query)
+        print(cur_name)
+
+        # Assess the preservation of modules in the test dataset.
+        preservation_test <- preservation_list[[cur_name]]
+
+        p_mat <- preservation_test$p.values
+
+        preservation_results <- data.frame(
+            Module = rownames(p_mat),
+            Sig_Count = apply(p_mat, 1, function(x) sum(x < 0.05)),
+            Status = apply(p_mat, 1, classify_preservation)
+        )
+        preservation_results$Status <- factor(
+            preservation_results$Status, 
+            levels = c("None", "Weak", "Moderate", "Strong")
+        )
+       # preservation_test[["status"]] <- preservation_results
+
+        # Assuming 'preservation1' is your NetRep result object
+        obs <- preservation_test$observed  # Matrix: modules x stats
+        nul <- preservation_test$nulls     # Array: modules x stats x permutations
+
+        # 1. Calculate the mean and SD across the 3rd dimension (permutations)
+        null_means <- apply(nul, c(1, 2), mean, na.rm = TRUE)
+        null_sds   <- apply(nul, c(1, 2), sd, na.rm = TRUE)
+
+        # 2. Calculate Z-scores: (Observed - Null Mean) / Null SD
+        z_scores <- (obs - null_means) / null_sds
+
+        # 3. Handle cases where SD is 0 (prevents Inf/NaN)
+        z_scores[null_sds == 0] <- 0
+
+        # 4. Create a "Z-summary" (the average Z-score across all 7 metrics)
+        z_summary_df <- data.frame(
+            Module = rownames(z_scores),
+            Z_summary = rowMeans(z_scores, na.rm = TRUE)
+        )
+        z_summary_df <- cbind(z_summary_df, preservation_results[,-1])
+        colnames(z_scores) <- paste0("Z_", colnames(z_scores))
+        z_summary_df <- cbind(z_summary_df, z_scores)
+
+
+        preservation_test[["summary"]] <- z_summary_df
+        preservation_list[[cur_name]] <- preservation_test
+
+    }
+}
+
+
+
+```
+
+Pairwise overlap test of Liver T1 modules vs. Liver T2 modules 
+
+(also could show an alluvial plot?)
+
+```{r eval=FALSE}
+
+library(GeneOverlap)
+
+
+cur_comparison <- "Liver"
+
+for(cur_comparison in names(comparisons)){
+
+
+    net1 <- comparisons[[cur_comparison]][1]
+    net2 <- comparisons[[cur_comparison]][2]
+    modules1 <- GetModules(seurat_list[[net1]])
+    modules2 <- GetModules(seurat_list[[net2]])
+
+
+    mods1 <- unique(as.character(modules1$module)); mods1 <- mods1[mods1 != 'grey']
+    mods2 <- unique(as.character(modules2$module)); mods2 <- mods2[mods2 != 'grey']
+
+
+    genome.size <- length(union(modules1$gene_name, modules2$gene_name))
+
+    # run overlaps between module gene lists and DEG lists:
+    overlap_df <- do.call(rbind, lapply(mods1, function(cur_mod1){
+    cur_modules1_genes <- modules1 %>% subset(module == cur_mod1) %>% .$gene_name
+    cur_overlap_df <- do.call(rbind, lapply(mods2, function(cur_mod2){
+        print(paste0(cur_mod1, ' ', cur_mod2))
+        cur_modules2_genes <- modules2 %>% subset(module == cur_mod2) %>% .$gene_name
+        cur_overlap <- testGeneOverlap(newGeneOverlap(
+            cur_modules1_genes,
+            cur_modules2_genes,
+            genome.size=genome.size
+        ))
+        c(cur_overlap@odds.ratio, cur_overlap@pval, cur_overlap@Jaccard, length(cur_overlap@intersection))
+    })) %>% as.data.frame
+    colnames(cur_overlap_df) <- c('odds_ratio', 'pval', 'Jaccard', 'size_intersection')
+    cur_overlap_df$modules1 <- cur_mod1
+    cur_overlap_df$modules2 <- mods2
+
+    # module color:
+    #cur_overlap_df$color <- modules %>% subset(module == cur_mod) %>% .$color %>% unique
+    cur_overlap_df
+    }))
+
+    overlap_df$modules1 <- factor(as.character(overlap_df$modules1), levels=mods1)
+    overlap_df$modules2 <- factor(as.character(overlap_df$modules2), levels=rev(mods2))
+
+    # adjust for multiple comparisons:
+    overlap_df$fdr <- p.adjust(overlap_df$pval, method='fdr')
+
+    # significance level:
+    overlap_df$Significance <- gtools::stars.pval(overlap_df$fdr)
+    overlap_df$Significance <- ifelse(
+    overlap_df$Significance == '.', '',
+    overlap_df$Significance
+    )
+
+
+    overlap_df$pair <- paste0(as.character(overlap_df$modules1), '_', as.character(overlap_df$modules2))
+
+    # save the pseudobulk module eigengene table:
+    #write.csv(overlap_df, file=paste0(data_dir, 'module_pairwise_overlap.csv'), quote=FALSE, row.names=FALSE)
+
+
+    # plot the results as a heatmap:
+    maxval <- 150
+    plot_df <- overlap_df
+    #plot_df$odds_ratio <- ifelse(plot_df$odds_ratio > maxval, maxval, plot_df$odds_ratio)
+    plot_df$textcolor <- ifelse(plot_df$odds_ratio > 0.7*maxval, 'white', 'black')
+    plot_df$size_intersection <- ifelse(plot_df$fdr < 0.05, plot_df$size_intersection, NA)
+
+    # get the module numbers:
+
+    p1 <- plot_df %>%
+    ggplot(aes(x=modules1, y=modules2)) +
+    geom_point(aes(size = Jaccard, fill=odds_ratio), color='lightgrey', shape=21, stroke=0.5) +
+    geom_point(
+        data = subset(plot_df, fdr < 0.05),
+        aes(size = Jaccard), shape = 21, color='black'
+    ) +
+    scale_fill_gradient(
+        low='white', 
+        high='navy', 
+        limits = c(0, maxval), 
+        oob = scales::squish
+        ) +
+    labs(fill = 'Odds ratio') +
+    scale_x_discrete(labels = function(x) gsub(".*_", "", x)) +
+    scale_y_discrete(labels = function(x) gsub(".*_", "", x)) +
+    theme(
+        panel.border = element_rect(fill=NA, color='black', size=1),
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.grid.major.y = element_line(linewidth=0.25, color='lightgrey'),
+        panel.grid.major.x = element_line(linewidth=0.25, color='lightgrey'),
+        plot.margin = margin(0,0,0,0)
+    ) +
+    #coord_equal() +
+    xlab(paste0(net1, " modules")) + ylab(paste0(net2, " modules")) 
+
+
+    # get the module preservation results
+    preservation1 <- preservation_list[[paste0(net1, '|', net2)]]
+    preservation2 <- preservation_list[[paste0(net2, '|', net1)]]
+
+    preservation_cp <- c("lightgrey", "grey", "coral", "firebrick")
+    names(preservation_cp) <- c("None", "Weak", "Moderate", "Strong")
+
+    p2 <- preservation1$summary  %>%
+        mutate(Module = factor(Module, levels = mods1)) %>%
+        arrange(Module) %>%
+        ggplot(aes(x = Module, y=Z_summary)) + 
+        geom_bar(aes(fill=Status), stat='identity', color='white') +
+        #geom_hline(yintercept=10, linetype='dashed', linewidth=0.5, color='lightgrey') +
+        scale_fill_manual(values = preservation_cp, drop=FALSE) +
+        scale_y_continuous(breaks = c(10, 30)) +
+        theme(
+            axis.text.x = element_blank(),
+            axis.title.x = element_blank(),
+            axis.line.x = element_blank(),
+            axis.ticks.x = element_blank(),
+            axis.title.y = element_blank(),
+            plot.margin = margin(0,0,0,0)
+        )
+
+    p3 <- preservation2$summary  %>%
+        mutate(Module = factor(Module, levels = mods2)) %>%
+        arrange(Module) %>%
+        ggplot(aes(y = Module, x=Z_summary)) + 
+        geom_bar(aes(fill=Status), stat='identity', color='white') +
+    # geom_vline(xintercept=10, linetype='dashed', linewidth=0.5, color='lightgrey') +
+        scale_fill_manual(values = preservation_cp, drop=FALSE) +
+        scale_x_continuous(breaks = c(10)) +
+        theme(
+            axis.text.y = element_blank(),
+            axis.title.y = element_blank(),
+            axis.line.y = element_blank(),
+            axis.ticks.y = element_blank(),
+            axis.title.x = element_blank(),
+            plot.margin = margin(0,0,0,0)
+        )
+
+    patch1 <- (p2 + plot_spacer()) + plot_layout(widths=c(5, 1))
+    patch2 <- (p1 + p3) + plot_layout(widths = c(5, 1))
+    patch <- (patch1 / patch2) + plot_layout(guides='collect', heights=c(1,5))
+
+
+
+    pdf(paste0(fig_dir, 'module_pairwise_overlap_', net1, '_vs_', net2,'.pdf'), width=6.5, height=5)
+    print(patch) 
+    dev.off()
+
+}
+
+```
+
+
+Visualize module topological differences (custom code)
+
+```{r eval=FALSE}
+
+plot_theme <- theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.ticks.y = element_blank(),
+        plot.title = element_text(hjust=0.5)
+    ) 
+
+cur_comparison <- "Lung"; i <- 1
+
+cur_mod <- 'Lung_T1_1'
+#cur_mod <- 'Liver_T1_1'
+
+
+for(cur_comparison in names(comparisons)){
+    
+    for(i in 1:2){
+        
+        # get the reference and the query networks:
+        ref <- comparisons[[cur_comparison]][i]
+        query <- comparisons[[cur_comparison]][-i] 
+        cur_name <- paste0(ref, '|', query)
+        print(cur_name)
+
+        ref_obj <- seurat_list[[ref]]
+        query_obj <- seurat_list[[query]]
+
+        # get the tissue and timepoint names:
+        cur_tissue <- unique(ref_obj$Tissue)
+        ref_tp <- unique(ref_obj$Timepoint)
+        query_tp <- unique(query_obj$Timepoint)
+
+        # load the topological overlap matrices:
+        TOM1 <- GetTOM(ref_obj)
+        TOM2 <- GetTOM(query_obj)
+
+        # get the modules from the reference dataset
+        modules <- GetModules(ref_obj) %>% 
+            subset(module != 'grey')
+
+        # get the list of genes to use for the comparison
+        genes_use <- intersect(modules$gene_name, colnames(TOM2))
+        modules <- modules %>% subset(gene_name %in% genes_use)
+
+        mods <- as.character(unique(modules$module))
+        plot_list <- list()
+        for(cur_mod in mods){
+            print(cur_mod)
+
+          hub_df <- GetHubGenes(ref_obj, n_hubs=Inf)
+            cur_genes <- subset(modules, module == cur_mod) %>% .$gene_name
+            hub_df <- subset(hub_df, gene_name %in% cur_genes)
+            cur_genes <- hub_df$gene_name
+
+            # format the matrix for plotting
+            tmp <- TOM1[cur_genes,cur_genes]
+            tmp[lower.tri(tmp)] <- 0
+            plot_df <- reshape2::melt(tmp) %>% subset(Var1 != Var2)
+
+            # set the order for the genes
+            plot_df$Var1 <- factor(plot_df$Var1, levels = cur_genes)
+            plot_df$Var2 <- factor(plot_df$Var2, levels = cur_genes)
+
+            max_val <- quantile(plot_df$value, 0.999)
+
+            # assemble the ggplot
+            p1 <- plot_df %>%
+                ggplot(aes(x=Var1, y=Var2, fill=value)) +
+                ggrastr::rasterise(geom_tile(), dpi=300) + 
+                scale_fill_gradientn(colors =  c('white', rev(viridis::mako(256))), limits = c(0, max_val), oob=scales::squish) +
+                # scale_fill_gradient(low='white', high='black', limits = c(0, max_val), oob=scales::squish) + 
+                plot_theme + 
+                coord_equal() + ylab('') + xlab('') +
+                ggtitle(ref) + labs(fill = cur_mod)
+
+
+            # format the matrix for plotting
+            tmp <- TOM2[cur_genes,cur_genes]
+            tmp[lower.tri(tmp)] <- 0
+            plot_df <- reshape2::melt(tmp) %>% subset(Var1 != Var2)
+
+            # set the order for the genes
+            plot_df$Var1 <- factor(plot_df$Var1, levels = cur_genes)
+            plot_df$Var2 <- factor(plot_df$Var2, levels = cur_genes)
+
+            # calculate the degrees
+            degree_df <- plot_df %>% group_by(Var1) %>% 
+                dplyr::summarise(degree = sum(value)) %>%
+                dplyr::mutate(weighted_degree = degree / max(degree)) %>%
+                dplyr::arrange(-degree) %>%
+                dplyr::rename(gene_name = Var1)
+
+            # assemble the ggplot
+            p2 <- plot_df %>%
+                ggplot(aes(x=Var1, y=Var2, fill=value)) +
+                ggrastr::rasterise(geom_tile(), dpi=300) + 
+                scale_fill_gradientn(colors = c('white', rev(viridis::mako(256))), limits = c(0, max_val), oob=scales::squish) +
+            # scale_fill_gradient(low='white', high='black', limits = c(0, max_val), oob=scales::squish) + 
+                plot_theme + 
+                coord_equal() + ylab('') + xlab('') +
+                ggtitle(query) + labs(fill = cur_mod)
+
+            cur_title <- paste0(cur_mod, " (N genes = ", length(cur_genes), ")" )
+
+            patch <- (p1 | p2) + plot_layout(guides='collect') + plot_annotation(title = cur_title) & theme(plot.title = element_text(hjust=0.5))
+
+            plot_list[[cur_mod]] <- patch
+
+        }
+
+        patch <- wrap_plots(plot_list, ncol=4)
+
+        pdf(paste0(fig_dir, 'modulepreservation_', ref, '.pdf'), width=20, height=10)
+        print(patch) 
+        dev.off() 
+
+    }
+}
+
+# patch <- ((p1 | p2) / (p3 | p4))+ plot_layout(guides='collect')
+
+# pdf(paste0(fig_dir, 'modulepreservation_', cur_mod, '.pdf'), width=7, height=4)
+# print(patch) 
+# dev.off()
+
+
+```

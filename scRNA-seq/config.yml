@@ -1,0 +1,238 @@
+# file path to the corresponding seurat object
+seurat_path:
+  "/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcells_integrated_annotated_seurat.rds"
+
+# define output directory and name to append to output files:
+
+#--------------------------------------------------------------------#
+# General settings
+#--------------------------------------------------------------------#
+
+general:
+  out_dir: "results/"
+  fig_dir: "figures/"
+  data_dir: "data/"
+  cores : 8
+  recompute_network: FALSE # whether to re-compute the network or load existing results
+  reduction_plot: "X_umap" # 2D embedding for plotting
+  nb_dpi: 150
+
+
+#--------------------------------------------------------------------#
+# External resources (misc)
+#--------------------------------------------------------------------#
+# resources:
+#   gene_anno: # mapping bet
+
+#--------------------------------------------------------------------#
+# Define the networks that we will construct
+#--------------------------------------------------------------------#
+
+# maybe will re-organize this?
+networks:
+
+  Liver_T1: # this will be the WGCNA name
+    group.by: "lv2"
+    groupnames: 
+    replicate: "Patient" # Patient or Replicate?
+    condition: "Tissue"
+    subset:
+        Primary_tumor: ["CRC"]
+        Tissue: ["Liver"]
+        Timepoint: ["1"]
+    recompute_network: FALSE
+
+  Lung_T1: # this will be the WGCNA name
+    group.by: "lv2"
+    groupnames: 
+    replicate: "Patient" # Patient or Replicate?
+    condition: "Tissue"
+    subset:
+        Primary_tumor: ["CRC"]
+        Tissue: ["Lung"]
+        Timepoint: ["1"]
+    recompute_network: TRUE
+
+#--------------------------------------------------------------------#
+# Settings for individual steps of WGCNA
+#--------------------------------------------------------------------#
+
+SetupForWGCNA:
+  features: NULL
+  metacell_location: NULL
+  gene_select: "fraction" 
+  fraction: 0.05
+  group.by: "annotation"
+  gene_list: NULL
+  assay: "RNA"
+
+MetacellsByGroups:
+  group.by: ["lv2"]
+  ident.group: ["lv2"]
+  k: 50
+  reduction: "X_pca_CellANOVA"
+  dims: NULL
+  assay: NULL
+  slot: "counts"
+  layer: "counts"
+  mode: "average"
+  cells.use: NULL
+  min_cells: 100
+  max_shared: 10
+  target_metacells: 100
+  max_iter: 5000
+  verbose: FALSE
+
+SetDatExpr:
+  group.by: NULL # setting this to NULL uses all of the metacells
+  group_name: NULL # setting this to NULL uses all of the metacells
+  slot: "data"
+  layer: "data"
+  assay: "RNA"
+
+TestSoftPowers:
+  powers: [1,2,3,4,5,6,7,8,9,10,12,14,16,18,20,22,24,26,28,30]
+  networkType: "signed"
+  corFnc: "bicor"
+
+ConstructNetwork:
+  soft_power: NULL
+  min_power: 3
+  tom_outdir: "TOM"
+  tom_name: NULL
+  consensus: FALSE
+  overwrite_tom: TRUE
+  wgcna_name: NULL
+  blocks: NULL
+  maxBlockSize: 30000
+  randomSeed: 12345
+  corType: "pearson"
+  consensusQuantile: 0.3
+  networkType: "signed"
+  TOMType: "signed"
+  TOMDenom: "min"
+  scaleTOMs: TRUE
+  calibrationQuantile: 0.95
+  sampleForCalibration: TRUE
+  sampleForCalibrationFactor: 1000
+  useDiskCache: TRUE
+  chunkSize: NULL
+  deepSplit: 4
+  pamStage: FALSE
+  detectCutHeight: 0.995
+  minModuleSize: 50
+  mergeCutHeight: 0.1
+  saveConsensusTOMs: TRUE
+
+ModuleEigengenes:
+  group.by.vars: "Replicate"
+  vars.to.regress: NULL
+  scale.model.use: "linear"
+  verbose: FALSE
+  assay: "RNA"
+
+ModuleConnectivity:
+  group.by: NULL
+  group_name: NULL
+  corFnc: "bicor"
+  corOptions: "use='p'"
+  harmonized: TRUE
+  assay: "RNA"
+  slot: "data"
+  layer: "data"
+  sparse: TRUE
+  reassign_modules: TRUE
+
+ResetModuleNames:
+  reset: TRUE
+  reset_levels: FALSE
+
+RunModuleUMAP:
+  n_hubs: 5
+  n_neighbors: 15
+  min_dist: 0.1
+  spread: 1
+  supervised: FALSE
+  target_weight: 0
+
+#--------------------------------------------------------------------#
+# Downstream analysis 
+#
+# 1. Enrichment 
+# 2. Module-trait relationships (pseudo-bulk...?)
+# 3. FindMarkers for module expression 
+#--------------------------------------------------------------------#
+
+
+#--------------------------------------------------------------------#
+# Plotting functions
+#--------------------------------------------------------------------#
+
+# initial UMAP plot (after subsetting)
+# replace with my custom function?
+PlotEmbedding:
+  plot: FALSE # skip plotting if this is false
+  width: 12
+  height: 8
+  raster: TRUE 
+  raster_dpi: 400
+  raster_scale: 1
+  point_size: 1
+  plot_under: TRUE
+  label: TRUE 
+  legend_point_size: 4
+  text_size: 3
+
+PlotSoftPowers:
+  plot: TRUE # skip plotting if this is false
+  width: 12
+  height: 8
+
+PlotDendrogram:
+  plot: TRUE # skip plotting if this is false
+  width: 8
+  height: 3
+
+# feature plot showing expression level of all modules
+ModuleFeaturePlot:
+  plot: TRUE # skip plotting if this is false
+  width: 3 # multiplied by ncol to get the final width
+  height: 3 # multiplied by nrow to get the final height
+  raster: TRUE 
+  raster_dpi: 300
+  order_points: TRUE
+  ncol: 6
+
+DotPlot:
+  plot: TRUE # skip plotting if this is false
+  scale_width: 0.66
+  scale_height: 0.25
+  high_color: "darkorchid3"
+  mid_color: "pink"
+  low_color: "whitesmoke"
+  dot.min: 0.1
+  coord_flip: TRUE
+
+# Should update the function!!!!
+ModuleNetworkPlot:
+  plot: TRUE # skip plotting if this is false
+  n_hubs: 25
+  height: 5
+  width: 5
+
+ModuleNetworkPlotly:
+  plot: TRUE 
+  n_hubs: 25
+  plot_width: 1200
+  plot_height: 900
+
+#--------------------------------------------------------------------#
+# Other stuff 
+#--------------------------------------------------------------------#
+
+HubGeneTable:
+  n_hubs: 25
+
+RunEnrichr:
+  dbs: ['GO_Biological_Process_2025']
+  max_genes: 200

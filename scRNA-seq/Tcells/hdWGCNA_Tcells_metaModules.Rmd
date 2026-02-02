@@ -1,0 +1,933 @@
+
+# launch an interactive node
+interactive 8 256G 12:00:00 genD
+
+# to launch:
+module load GCC
+conda activate compact
+
+
+```{r eval=FALSE}
+
+# input handling packages
+library(yaml)
+library(assertthat)
+
+# data wrangling & plotting packages
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+library(crayon)
+
+# single-cell & data analysis packages
+library(Seurat)
+library(Matrix)
+
+# network analysis
+library(WGCNA)
+library(hdWGCNA)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+
+# interactive elements etc
+library(DT)
+library(IRdisplay)
+library(glue)
+library(plotly)
+
+# set the plotting theme
+theme_set(theme_cowplot())
+
+
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/hdWGCNA_snakemake/')
+
+# source helper functions
+source("scripts/helper_functions.R")
+source("scripts/plotting_functions.R")
+
+# load the configuration file:
+config_file <- "config.yml"
+config <- yaml::read_yaml(config_file)
+gen_opts <- config$general
+networks <- names(config$networks)
+
+fig_dir <- 'figures/'
+data_dir <- 'data/'
+
+# load the full Seurat object
+seurat_obj <- readRDS(config$seurat_path)
+
+# load the individual seurat objects from each network analysis
+seurat_list <- lapply(networks, function(wgcna_name){
+    print(wgcna_name)
+    cur_obj <- readRDS(paste0(gen_opts$out_dir, '/', wgcna_name, '/', gen_opts$data_dir, '/', wgcna_name, '_hdWGCNA.rds'))
+    cur_obj
+})
+names(seurat_list) <- networks
+
+```
+
+Calculate pairwise overlap of all modules across 
+
+```{r eval=FALSE}
+
+library(GeneOverlap)
+
+# aggregate modules into a single table
+modules <- do.call(rbind, lapply(networks, function(cur_net){
+    cur_obj <- SetActiveWGCNA(seurat_list[[cur_net]], wgcna_name = cur_net)
+    cur_modules <- GetModules(cur_obj)[,1:3] %>% subset(module != 'grey') %>% 
+        mutate(module = droplevels(module))
+    rownames(cur_modules) <- 1:nrow(cur_modules)
+    cur_modules$network <- cur_net 
+    cur_modules
+}))
+head(modules)
+
+modules1 <- modules
+modules2 <- modules
+
+
+mods1 <- unique(as.character(modules1$module)); mods1 <- mods1[mods1 != 'grey']
+mods2 <- unique(as.character(modules2$module)); mods2 <- mods2[mods2 != 'grey']
+
+
+genome.size <- length(union(modules1$gene_name, modules2$gene_name))
+
+# run overlaps between module gene lists and DEG lists:
+overlap_df <- do.call(rbind, lapply(mods1, function(cur_mod1){
+  cur_modules1_genes <- modules1 %>% subset(module == cur_mod1) %>% .$gene_name
+  cur_overlap_df <- do.call(rbind, lapply(mods2, function(cur_mod2){
+    print(paste0(cur_mod1, ' ', cur_mod2))
+    cur_modules2_genes <- modules2 %>% subset(module == cur_mod2) %>% .$gene_name
+    cur_overlap <- testGeneOverlap(newGeneOverlap(
+        cur_modules1_genes,
+        cur_modules2_genes,
+        genome.size=genome.size
+    ))
+    c(cur_overlap@odds.ratio, cur_overlap@pval, cur_overlap@Jaccard, length(cur_overlap@intersection))
+  })) %>% as.data.frame
+  colnames(cur_overlap_df) <- c('odds_ratio', 'pval', 'Jaccard', 'size_intersection')
+  cur_overlap_df$modules1 <- cur_mod1
+  cur_overlap_df$modules2 <- mods2
+
+  # module color:
+  #cur_overlap_df$color <- modules %>% subset(module == cur_mod) %>% .$color %>% unique
+  cur_overlap_df
+}))
+
+overlap_df$modules1 <- factor(as.character(overlap_df$modules1), levels=mods1)
+overlap_df$modules2 <- factor(as.character(overlap_df$modules2), levels=mods2)
+
+# adjust for multiple comparisons:
+overlap_df$fdr <- p.adjust(overlap_df$pval, method='fdr')
+
+# significance level:
+overlap_df$Significance <- gtools::stars.pval(overlap_df$fdr)
+overlap_df$Significance <- ifelse(
+  overlap_df$Significance == '.', '',
+  overlap_df$Significance
+)
+
+# hierarchical clustering of the module-module overlap matrix
+overlap_mat <- overlap_df %>% 
+    select(c(odds_ratio, modules1, modules2)) %>%
+    mutate(odds_ratio = ifelse(modules1 == modules2, 0, odds_ratio)) %>%
+    pivot_wider(values_from=odds_ratio, names_from=modules1) %>%
+    as.data.frame()
+rownames(overlap_mat) <- overlap_mat[,1] 
+overlap_mat <- as.matrix(overlap_mat[,2:ncol(overlap_mat)])
+dendro <- hclust(dist(overlap_mat))
+
+# order based on hierarchical clustering:
+overlap_df$modules1 <- factor(as.character(overlap_df$modules1), levels=dendro$labels[dendro$order])
+overlap_df$modules2 <- factor(as.character(overlap_df$modules2), levels=dendro$labels[dendro$order])
+
+
+overlap_df$pair <- paste0(as.character(overlap_df$modules1), '_', as.character(overlap_df$modules2))
+
+# save the pseudobulk module eigengene table:
+write.csv(overlap_df, file=paste0(data_dir, 'module_pairwise_overlap.csv'), quote=FALSE, row.names=FALSE)
+
+# plot the results as a heatmap:
+maxval <- 100
+plot_df <- overlap_df
+plot_df$odds_ratio <- ifelse(plot_df$odds_ratio > maxval, maxval, plot_df$odds_ratio)
+plot_df$textcolor <- ifelse(plot_df$odds_ratio > 0.7*maxval, 'white', 'black')
+plot_df$size_intersection <- ifelse(plot_df$fdr < 0.05, plot_df$size_intersection, NA)
+
+
+p1 <- plot_df %>%
+  ggplot(aes(x=modules1, y=modules2, fill=odds_ratio)) +
+  geom_tile() +
+  geom_text(label=plot_df$Significance, vjust = 0.72, color=plot_df$textcolor) +
+  scale_fill_gradient(low='white', high='navy') +
+  RotatedAxis() +
+  labs(fill = 'Odds ratio') +
+  theme(
+    panel.border = element_rect(fill=NA, color='black', size=1),
+    axis.line.x = element_blank(),
+    axis.line.y = element_blank(),
+    axis.text.y = element_text(size=6),
+    axis.text.x = element_text(size=6)
+
+  ) +
+  coord_equal() + xlab('') + ylab('')
+
+pdf(paste0(fig_dir, 'module_pairwise_overlap.pdf'), width=16, height=16)
+print(p1) 
+dev.off()
+
+
+```
+
+Correlate TCAT single-cell scores with single-cell MEs 
+
+```{r eval=FALSE}
+
+# load the TCAT results:
+tcat_weights <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/TCAT_reference_weights.csv")
+rownames(tcat_weights) <- gsub('[-/]', '.', tcat_weights$X)
+tcat_weights <- tcat_weights[,-1]
+
+tcat_signatures <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcells_TCAT_scores.csv")
+rownames(tcat_signatures) <- tcat_signatures$barcode
+tcat_signatures <- tcat_signatures[,-1]
+
+tcat_scores <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcells_TCAT_summaries.csv")
+
+
+# as an example
+module_cGEP_comparison <- data.frame()
+for(cur_net in networks){
+
+    cur_seurat <- seurat_list[[cur_net]]
+
+    MEs <- hdWGCNA::GetMEs(seurat_list[[cur_net]], wgcna_name = cur_net)
+    MEs <- MEs[,colnames(MEs) != 'grey']
+    cur_tcat <- tcat_signatures[rownames(MEs),]
+
+    # calculate pairwise correlation
+    signature_cor <- cor(MEs, cur_tcat)
+
+    # hierarchical clustering
+    dendro1 <- hclust(dist(signature_cor ))
+    dendro2 <- hclust(dist(t(signature_cor )))
+
+    # signature_cor <- signature_cor[]
+
+    plot_df <- reshape2::melt(signature_cor) %>%
+        dplyr::rename(module = Var1, cGEP = Var2, cor=value)
+
+    plot_df$module <- factor(as.character(plot_df$module), levels=dendro1$labels[dendro1$order])
+    plot_df$cGEP <- factor(as.character(plot_df$cGEP), levels=dendro2$labels[dendro2$order])
+
+    plot_df_expression <- plot_df
+
+    #---------------------------------------------------------#
+    # Correlate the TCAT weights with the module kMEs
+    #---------------------------------------------------------#
+
+    cur_modules <- GetModules(seurat_list[[cur_net]], wgcna_name=cur_net) 
+    genes_keep <- intersect(cur_modules$gene_name, colnames(tcat_weights))
+    cur_modules <- cur_modules %>% select(-c(gene_name, module, color, kME_grey))
+    cur_modules <- as.matrix(cur_modules[genes_keep,])
+    cur_tcat_weights <- t(tcat_weights[,genes_keep])
+
+    weight_cor <- cor(cur_modules, cur_tcat_weights)
+
+    # hierarchical clustering
+    dendro1 <- hclust(dist(weight_cor ))
+    dendro2 <- hclust(dist(t(weight_cor)))
+
+    plot_df <- reshape2::melt(weight_cor) %>%
+        dplyr::rename(module = Var1, cGEP = Var2, cor=value)
+
+    plot_df$module <- factor(as.character(plot_df$module), levels=dendro1$labels[dendro1$order])
+    plot_df$cGEP <- factor(as.character(plot_df$cGEP), levels=dendro2$labels[dendro2$order])
+
+    plot_df_weights <- plot_df
+
+    #---------------------------------------------------------#
+    # Make a dot plot with both correlations
+    #---------------------------------------------------------#
+
+    plot_df_weights$module <- gsub('kME_', '', plot_df_weights$module)
+    plot_df_weights$cGEP <- gsub('[-/]', '.', plot_df_weights$cGEP)
+    plot_df_weights$pair <- paste0(as.character(plot_df_weights$module), '_', as.character(plot_df_weights$cGEP))
+    plot_df_expression$pair <- paste0(as.character(plot_df_expression$module), '_', as.character(plot_df_expression$cGEP))
+
+    # join the tables together
+    plot_df <- dplyr::left_join(
+        plot_df_expression,
+        plot_df_weights,
+        by = 'pair'
+    )
+
+    # clean up the unused columns 
+    plot_df <- plot_df %>% dplyr::select(c(module.x, cGEP.x, pair, cor.x, cor.y)) %>%
+        dplyr::rename(cGEP = cGEP.x, module = module.x, exp_cor = cor.x, weight_cor = cor.y)
+
+    p1 <- plot_df %>%
+    ggplot(aes(x=cGEP, y=module)) +
+    geom_point(aes(color=exp_cor, size=abs(weight_cor))) +
+    scale_color_gradient2(mid='whitesmoke', high='darkorange3', low='navy') +
+    RotatedAxis() +
+    labs(color = 'Expression\nCorrelation', size="Gene Weight\nCorrelation") +
+    ggtitle(paste0(cur_net, ' modules vs. TCAT cGEPs')) +
+    theme(
+        panel.border = element_rect(fill=NA, color='black', size=1),
+        plot.title = element_text(hjust=0.5, size=12, face='bold'),
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        axis.text.y = element_text(size=7),
+        axis.text.x = element_text(size=7),
+        panel.grid.major = element_line(linewidth=0.25, color='lightgrey')
+    ) +
+    coord_equal() + xlab('') + ylab('')
+
+    pdf(paste0(fig_dir, 'module_TCAT_compare_', cur_net, '.pdf'), width=12, height=6)
+    print(p1) 
+    dev.off()
+
+    module_cGEP_comparison <- rbind(module_cGEP_comparison, plot_df)
+
+}
+
+
+#---------------------------------------------------------#
+# Test making a scatter plot
+#---------------------------------------------------------#
+
+cur_mod <- 'Liver_T1_5'
+cur_cGEP <- 'Treg'
+group.by <- 'annotation'
+
+
+scatter_df <- data.frame(
+    module = MEs[,cur_mod],
+    cGEP = cur_tcat[,cur_cGEP],
+    group = cur_seurat@meta.data[,group.by]
+)
+
+p <- scatter_df %>% ggplot(aes(x = module, y = cGEP)) + 
+    ggrastr::rasterise(geom_point(aes(color=group)), dpi=200) + 
+    geom_smooth(method='lm', color='black') + 
+    ggpubr::stat_cor() 
+
+
+pdf(paste0(fig_dir, 'test_module_TCAT_compare.pdf'), width=12, height=6)
+p 
+dev.off()
+
+
+pdf(paste0(fig_dir, 'test_module_TCAT_split.pdf'), width=12, height=12)
+p + facet_wrap(~group) + NoLegend()
+dev.off()
+
+
+
+```
+
+
+
+Calculate pseudobulk module eigengenes w/ WGCNA 
+
+OLD CODE
+
+```{r eval=FALSE}
+
+#---------------------------------------------------------#
+# Calculate pseudo-bulk module eigengenes w/ WGCNA
+#---------------------------------------------------------#
+
+# use the vst-normalized dataset
+X <- norm_datExpr
+
+mods <- unique(as.character(modules$module))
+eigengene_list <- lapply(mods, function(mod) {
+    print(mod)
+    genes <- subset(modules, module == mod) %>% .$gene_name
+    colors <- rep(mod, length(genes)); names(colors) <- genes
+    ME <- WGCNA::moduleEigengenes(t(X[genes, , drop=FALSE]), colors = colors)$eigengenes
+    return(ME[[1]])
+})
+
+MEs <- as.data.frame(do.call(cbind, eigengene_list))
+colnames(MEs) <- mods; rownames(MEs) <- colnames(X)
+MEs$pseudobulk <- rownames(MEs)
+
+# cast from wide to long format:
+ME_df <- tidyr::pivot_longer(
+  MEs,
+  cols = all_of(mods)) %>%
+  dplyr::rename(module = name, score = value)
+
+# add the sample column 
+tmp <- do.call(rbind, str_split(ME_df$pseudobulk, ':'))
+ME_df$cluster <- tmp[,1]
+ME_df$Patient <- tmp[,2]
+ME_df$Timepoint <- tmp[,3]
+
+head(ME_df)
+
+# save the pseudobulk module eigengene table:
+write.csv(ME_df, file=paste0(data_dir, 'pseudobulk_module_MEs.csv'), quote=FALSE, row.names=FALSE)
+
+```
+
+Calculate pseudo-bulk module scores w/ DecoupleR 
+
+```{r eval=FALSE}
+
+library(decoupleR)
+
+# load the top hub genes per module
+n_hubs <- 100
+hub_df <- do.call(rbind, lapply(networks, function(cur_net){
+    cur_obj <- SetActiveWGCNA(seurat_list[[cur_net]], wgcna_name = cur_net)
+    cur_modules <- GetDegrees(cur_obj) %>% 
+        subset(module != 'grey') %>% 
+        dplyr::mutate(module = droplevels(module)) %>%
+        dplyr::group_by(module) %>%
+        dplyr::slice_max(n=n_hubs, order_by=weighted_degree) %>%
+        dplyr::select(!degree) %>% 
+        dplyr::rename(weight = weighted_degree)
+      
+    cur_modules$network <- cur_net 
+    cur_modules
+}))
+
+# define the expression matrix to use
+X <- norm_datExpr
+
+signature_df <- data.frame()
+for(cur_net in networks){
+
+  print(cur_net)
+  cur_df <- subset(hub_df, network == cur_net) %>%
+    mutate(module = droplevels(module))
+
+  cur_signature_df <- decoupleR::run_mlm(
+    mat = X,
+    net = cur_df,
+    .source = 'module',
+    .target = 'gene_name',
+    .mor = 'weight'
+  )
+
+  cur_signature_df$network <- cur_net
+  signature_df <- rbind(signature_df, cur_signature_df)
+
+}
+
+# re-name column:
+signature_df <- dplyr::rename(signature_df, module = source)
+signature_df <- dplyr::rename(signature_df, pseudobulk = condition)
+
+tmp <- do.call(rbind, str_split(signature_df$pseudobulk, ':'))
+signature_df$cluster <- tmp[,1]
+signature_df$Patient <- tmp[,2]
+signature_df$Timepoint <- tmp[,3]
+
+
+write.csv(signature_df, file=paste0(data_dir, 'pseudobulk_module_decoupleR_mlm.csv'), quote=FALSE)
+
+```
+
+
+Create a module-module graph based on expression correlation and 
+gene set overlaps 
+
+```{r eval=FALSE}
+
+ME_df <- read.csv(file=paste0(data_dir, 'pseudobulk_module_MEs.csv'))
+overlap_df <- read.csv(file=paste0(data_dir, 'module_pairwise_overlap.csv'))
+
+MEs <- ME_df %>% select(c(pseudobulk, module, score)) %>%
+    pivot_wider(values_from=score, names_from=module) %>%
+    as.data.frame()
+rownames(MEs) <- MEs[,1]
+MEs <- MEs[,2:ncol(MEs)]
+
+
+cor_MEs <- cor(MEs, method='pearson')
+
+cor_MEs[lower.tri(cor_MEs)] <- NA 
+tmp <- as.data.frame(cor_MEs)
+tmp$module <- rownames(tmp)
+
+graph_df <- tmp %>% 
+    tidyr::pivot_longer(
+        cols = all_of(mods)
+    ) %>% 
+    dplyr::rename(
+        module1 = module,
+        module2 = name,
+        cor = value
+    ) %>%
+    subset((!is.na(cor)) & (module1 != module2)) 
+
+graph_df$pair <- paste0(as.character(graph_df$module1), '_', as.character(graph_df$module2))
+
+# add the overlap stats;
+tmp <- dplyr::left_join(
+    graph_df,
+    overlap_df, 
+    by = 'pair'
+)
+graph_df$Jaccard <- tmp$Jaccard 
+graph_df$odds_ratio <- tmp$odds_ratio 
+graph_df$overlap_pval <- tmp$pval
+graph_df$overlap_fdr <- tmp$fdr
+
+# scale Jaccard index and Cor from 0 to 1
+graph_df$cor_scaled <- scales::rescale(graph_df$cor, to = c(0, 1))
+graph_df$Jaccard_scaled <- scales::rescale(graph_df$Jaccard, to = c(0, 1))
+
+graph_df_full <- graph_df
+
+```
+
+
+Run a loop over different alpha values:
+
+Result: Alpha = 0.5 seems reasonable to proceed 
+
+```{r eval=FALSE}
+
+# calculate a composite weight based on correlation of the MEs + overlap
+
+edge_prop <- 0.1
+louvain_resolution <- 1
+alphas <- (0:10)/10
+
+plot_list <- list()
+for(alpha in alphas){
+    print(alpha)
+    graph_df$weight <- (alpha * graph_df$cor_scaled) + ((1 - alpha) * graph_df$Jaccard_scaled)
+
+    graph_df$weight <- (alpha * graph_df$cor_scaled) + ((1 - alpha) * graph_df$Jaccard_scaled)
+
+
+    # take the 10% strongest edges:
+    graph_df <- graph_df %>% 
+        slice_max(n = round(edge_prop * nrow(graph_df)), order_by = weight)
+
+    graph <- graph_df %>%
+        igraph::graph_from_data_frame(directed=FALSE)
+
+    # clustering:
+    node_clusters <- igraph::cluster_louvain(graph, weights=NULL, resolution = louvain_resolution)
+    V(graph)$louvain <- paste0('MM-', node_clusters$membership)
+
+    graph <- graph %>% 
+        tidygraph::as_tbl_graph(directed=FALSE) %>%
+        tidygraph::activate(nodes)
+
+    # how many clusters?
+    n_clusters <- length(unique(V(graph)$louvain))
+
+
+    p <- ggraph(graph, layout=layout_nicely(graph), weight=weight) + 
+        ggrastr::rasterise(geom_edge_link(aes(color=weight, alpha=weight)), dpi=100) + 
+        geom_node_point(aes(color=louvain), size=3) +
+        # geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) +
+        #scale_colour_manual(values=mod_cp) +
+        scale_edge_colour_gradient2(high='grey', low='whitesmoke') +
+        ggtitle(paste0("alpha: ", alpha, ", n_clusters: ", n_clusters)) +
+        NoLegend()
+
+    plot_list[[as.character(alpha)]] <- p
+
+    # reset 
+    graph_df <- graph_df_full
+}
+
+patch <- wrap_plots(plot_list, ncol=4)
+
+pdf(paste0(fig_dir, 'test_metamodule_graph_alphas2.pdf'), width=20, height=12)
+print(patch) 
+dev.off()
+
+p <- plot_list[["0.5"]] + 
+    geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) 
+
+pdf(paste0(fig_dir, 'test_metamodule_graph_alphas_individual.pdf'), width=10, height=10)
+print(p) 
+dev.off()
+
+
+
+```
+
+Test edge selection procedure:
+
+* Top % strongest edges across whole graph 
+* Top N strongest edges per node 
+* 
+
+```{r eval=FALSE}
+
+# calculate a composite weight based on correlation of the MEs + overlap
+
+edge_props <- c(0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5)
+alpha <- 0.6
+louvain_resolution <- 1
+
+plot_list <- list()
+for(edge_prop in edge_props){
+    print(edge_prop)
+    graph_df$weight <- (alpha * graph_df$cor_scaled) + ((1 - alpha) * graph_df$Jaccard_scaled)
+
+    graph_df <- graph_df %>% 
+        slice_max(n = round(edge_prop * nrow(graph_df)), order_by = weight)
+
+    graph <- graph_df %>%
+        igraph::graph_from_data_frame(directed=FALSE)
+
+    # clustering:
+    node_clusters <- igraph::cluster_louvain(graph, weights=NULL, resolution = louvain_resolution)
+    V(graph)$louvain <- paste0('MM-', node_clusters$membership)
+
+    graph <- graph %>% 
+        tidygraph::as_tbl_graph(directed=FALSE) %>%
+        tidygraph::activate(nodes)
+
+    # how many clusters?
+    n_clusters <- length(unique(V(graph)$louvain))
+
+    p <- ggraph(graph, layout=layout_nicely(graph), weight=weight) + 
+        ggrastr::rasterise(geom_edge_link(aes(color=weight, alpha=weight)), dpi=100) + 
+        geom_node_point(aes(color=louvain), size=3) +
+        # geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) +
+        #scale_colour_manual(values=mod_cp) +
+        scale_edge_colour_gradient2(high='grey', low='whitesmoke') +
+        ggtitle(paste0("edge_prop: ", edge_prop, ", n_clusters: ", n_clusters)) +
+        NoLegend()
+
+    plot_list[[as.character(edge_prop)]] <- p
+
+    # reset 
+    graph_df <- graph_df_full
+}
+
+patch <- wrap_plots(plot_list, ncol=4)
+
+pdf(paste0(fig_dir, 'test_metamodule_graph_edge_prop.pdf'), width=20, height=12)
+print(patch) 
+dev.off()
+
+
+#---------------------------------------------------------#
+# Test leiden resolutions
+#---------------------------------------------------------#
+
+edge_prop <- 0.1
+resolutions <- c(0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5)
+alpha <- 0.6
+
+graph_df$weight <- (alpha * graph_df$cor_scaled) + ((1 - alpha) * graph_df$Jaccard_scaled)
+
+graph_df <- graph_df %>% 
+    slice_max(n = round(edge_prop * nrow(graph_df)), order_by = weight)
+
+graph <- graph_df %>%
+    igraph::graph_from_data_frame(directed=FALSE)
+
+graph <- graph %>% 
+    tidygraph::as_tbl_graph(directed=FALSE) %>%
+    tidygraph::activate(nodes)
+
+lay <- layout_nicely(graph)
+
+plot_list <- list()
+for(res in resolutions){
+   
+    print(res)
+
+    # clustering:
+    node_clusters <- igraph::cluster_leiden(graph, weights=NULL, resolution = res, objective_function='modularity')
+    V(graph)$leiden <- paste0('MM-', node_clusters$membership)
+
+    graph <- graph %>% 
+        tidygraph::as_tbl_graph(directed=FALSE) %>%
+        tidygraph::activate(nodes)
+
+    # how many clusters?
+    n_clusters <- length(unique(V(graph)$leiden))
+    print(n_clusters)
+
+    p <- ggraph(graph, layout=lay, weight=weight) + 
+        ggrastr::rasterise(geom_edge_link(aes(color=weight, alpha=weight)), dpi=100) + 
+        geom_node_point(aes(color=leiden), size=3) +
+        # geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) +
+        #scale_colour_manual(values=mod_cp) +
+        scale_edge_colour_gradient2(high='grey', low='whitesmoke') +
+        ggtitle(paste0("Leiden res: ", res, ", n_clusters: ", n_clusters)) +
+        NoLegend()
+
+    plot_list[[as.character(res)]] <- p
+
+    # reset 
+    graph_df <- graph_df_full
+}
+
+patch <- wrap_plots(plot_list, ncol=4)
+
+pdf(paste0(fig_dir, 'test_metamodule_graph_leiden_resolution.pdf'), width=20, height=12)
+print(patch) 
+dev.off()
+
+
+
+```
+
+
+Create a graph using the settings identified above
+
+```{r eval=FALSE}
+
+library(igraph)
+library(tidygraph)
+library(ggraph)
+
+
+alpha <- 0.5
+cluster_resolution <- 2.5
+edge_prop <- 0.1
+
+# calculate a composite weight based on correlation of the MEs + overlap
+graph_df$weight <- (alpha * graph_df$cor_scaled) + ((1 - alpha) * graph_df$Jaccard_scaled)
+
+graph_df <- graph_df %>% 
+    slice_max(n = round(edge_prop * nrow(graph_df)), order_by = weight)
+
+graph <- graph_df %>%
+    igraph::graph_from_data_frame(directed=FALSE)
+
+# clustering:
+louvain_clusters <- igraph::cluster_louvain(graph, weights=NULL, resolution = cluster_resolution)
+leiden_clusters <- igraph::cluster_leiden(graph, weights=NULL, resolution = cluster_resolution, objective_function = 'modularity')
+V(graph)$louvain <- paste0('LV-', louvain_clusters$membership)
+V(graph)$leiden <- paste0('LD-', leiden_clusters$membership)
+
+n_louvain <- length(unique(V(graph)$louvain))
+n_leiden <- length(unique(V(graph)$leiden))
+
+
+# are the module-module pairs in the same leiden cluster?
+
+graph <- graph %>% 
+    tidygraph::as_tbl_graph(directed=FALSE) %>%
+    tidygraph::activate(nodes)
+
+
+# lay <- layout_with_fr(graph)
+lay <- ggraph::create_layout(graph, layout='igraph', algorithm = 'nicely')
+
+p1 <- ggraph(graph, layout=lay, weight=weight) + 
+  ggrastr::rasterise(geom_edge_link(aes(color=weight, alpha=weight)), dpi=300) + 
+  geom_node_point(aes(fill=leiden), size=3, shape=21, color='white') +
+  scale_edge_colour_gradient2(high='grey', low='whitesmoke') + NoLegend()
+
+pdf(paste0(fig_dir, 'test_metamodule_graph_leiden.pdf'), width=5, height=4)
+print(p1)
+dev.off()
+
+
+
+cGEP_plot <- "Cytotoxic"
+cGEP_plot <- "Exhaustion"
+cGEP_df <- subset(module_cGEP_comparison, cGEP == cGEP_plot & module %in% V(graph)$name)
+rownames(cGEP_df) <- cGEP_df$module
+
+# graph <- set_vertex_attr(graph, name = cGEP_plot, index=cGEP_df$module, value=cGEP_df$exp_cor)
+V(graph)$exp_cor <- cGEP_df[V(graph)$name, 'exp_cor']
+
+lay <- ggraph::create_layout(graph, layout='igraph', algorithm = 'nicely')
+
+
+p <- ggraph(graph, layout=lay, weight=weight) + 
+  ggrastr::rasterise(geom_edge_link(aes(color=weight, alpha=weight)), dpi=300) + 
+  geom_node_point(aes(fill=exp_cor), size=3, shape=21, color='white') +
+  geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) +
+  scale_fill_gradient2(mid='whitesmoke', low='navy', high='darkorange3') + 
+  scale_edge_colour_gradient2(high='grey', low='whitesmoke')   +
+    ggtitle(cGEP_plot) + theme(
+        plot.title = element_text(hjust=0.5)
+    )
+
+
+pdf(paste0(fig_dir, 'test_metamodule_graph_cGEP.pdf'), width=10, height=8)
+p
+dev.off()
+
+
+
+p1 <- ggraph(graph, layout=lay, weight=weight) + 
+  ggrastr::rasterise(geom_edge_link(aes(color=weight, alpha=weight)), dpi=300) + 
+  geom_node_point(aes(fill=exp_cor), size=3, shape=21, color='white') +
+  scale_edge_colour_gradient2(high='grey', low='whitesmoke') +
+    scale_fill_gradient2(mid='whitesmoke', low='navy', high='darkorange3') + NoLegend() +
+    ggtitle(cGEP_plot) + theme(
+        plot.title = element_text(hjust=0.5)
+    )
+
+pdf(paste0(fig_dir, 'test_metamodule_graph_cGEP_small.pdf'), width=5, height=4)
+print(p1)
+dev.off()
+
+
+```
+
+Test pariwise comparisons (differential module eigengenes)
+
+```{r eval=FALSE}
+
+ME_df <- read.csv(file=paste0(data_dir, 'pseudobulk_module_MEs.csv'))
+
+
+```
+
+
+
+
+Below: Not run
+
+```{r eval=FALSE}
+
+
+#---------------------------------------------------------#
+# GO term enrichment with enrichR
+#---------------------------------------------------------#
+
+library(enrichR)
+
+dbs <-c('GO_Biological_Process_2025')
+
+combined_df <- data.frame()
+
+
+for(cur_net in networks){
+  print(cur_net)
+
+  enrichr_df <- read.delim(file=paste0(data_dir, cur_net, '_hdWGCNA_enrichr_signif.tsv'), sep='\t')
+  combined_df <- rbind(combined_df, enrichr_df)
+
+}
+
+
+#---------------------------------------------------------#
+# Plot the network with each dot colored by a GO term
+#---------------------------------------------------------#
+
+graph <- graph_df %>%
+    igraph::graph_from_data_frame(directed=FALSE)
+
+# clustering:
+louvain_clusters <- igraph::cluster_louvain(graph, weights=NULL, resolution = cluster_resolution)
+leiden_clusters <- igraph::cluster_leiden(graph, weights=NULL, resolution = cluster_resolution, objective_function = 'modularity')
+V(graph)$louvain <- paste0('LV-', louvain_clusters$membership)
+V(graph)$leiden <- paste0('LD-', leiden_clusters$membership)
+
+n_louvain <- length(unique(V(graph)$louvain))
+n_leiden <- length(unique(V(graph)$leiden))
+
+graph <- graph %>% 
+    tidygraph::as_tbl_graph(directed=FALSE) %>%
+    tidygraph::activate(nodes)
+
+
+lay <- ggraph::create_layout(graph, layout='igraph', algorithm = 'nicely')
+
+
+term_list <- list(
+    "T Cell Activation (GO:0042110)",
+    "Response to Cytokine (GO:0034097)",
+    "Regulation of T Cell Chemotaxis (GO:0010819)",
+    "Regulation of Gene Expression (GO:0010468)",
+    "Cellular Respiration (GO:0045333)",
+    "Mitotic Nuclear Division (GO:0140014)",
+    "Regulation of Apoptotic Process (GO:0042981)",
+    "Inflammatory Response (GO:0006954)",
+    "Interleukin-27-Mediated Signaling Pathway (GO:0070106)",
+    "Cytoplasmic Translation (GO:0002181)",
+    "MHC Class II Protein Complex Assembly (GO:0002399)",
+    "Chromatin Remodeling at Centromere (GO:0031055)"
+)
+
+plot_list <- list()
+
+for(cur_term in term_list){
+
+
+    cur_df <- subset(combined_df, Term == cur_term)
+    ix <- match(V(graph)$name, cur_df$module)
+    lay$enrichment <- cur_df[ix,"Combined.Score"]
+    lay$pval <- cur_df[ix, "Adjusted.P.value"]
+    lay$enrichment <- ifelse(is.na(lay$enrichment), 0, lay$enrichment)
+    lay$pval <- ifelse(is.na(lay$pval), 1, lay$pval)
+
+    # # new order?
+    # lay <- lay %>% arrange(enrichment)
+    # ix <- match(lay$name, V(graph)$name)
+    # graph <- igraph::permute(graph, ix)
+
+    plot_list[[cur_term]] <- ggraph(lay) + 
+        ggrastr::rasterise(geom_edge_link(aes(color=weight, alpha=weight)), dpi=150) + 
+        geom_node_point(
+            data  = subset(lay, pval > 0.05),
+            size=1, color='white', fill='lightgrey', shape=21) +
+        geom_node_point(
+            data  = subset(lay, pval <= 0.05),
+            aes(fill=enrichment, size=-log10(pval)), shape=21, color='black') +
+        #geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) +
+        scale_fill_gradient2(high = 'darkorchid3', low='lightgrey') + 
+        scale_edge_colour_gradient2(high='grey', low='whitesmoke') +
+        ggtitle(cur_term) + NoLegend() + theme(
+            plot.title = element_text(hjust=0.5, size=10)
+        )
+}
+
+patch <- wrap_plots(plot_list, ncol=4)
+
+pdf(paste0(fig_dir, 'test_metamodule_graph_enrichment2.pdf'), width=16, height=9)
+print(patch)
+dev.off()
+
+
+#---------------------------------------------------------#
+# Graph-based analysis to prioritize the GO terms
+#---------------------------------------------------------#
+
+# add the community name
+tmp <- left_join(
+    combined_df,
+    dplyr::rename(lay, module = name),
+    by = 'module',
+)
+combined_df$leiden <- tmp$leiden
+
+
+# what terms appear across modules in the same community?
+# how to avoid bias against small communities? 
+
+tmp <- combined_df %>% 
+    subset(Adjusted.P.value <= 0.01) %>%
+    group_by(leiden, Term) %>%
+    summarise(count = n())
+
+# what terms appear in modules from different communities?
+
+
+tmp <- combined_df %>%
+    group_by(Term) %>%
+    summarise(score = sum(Combined.Score) / length(networks)) %>%
+    arrange(desc(score))
+
+print(tmp, n=25)
+
+```

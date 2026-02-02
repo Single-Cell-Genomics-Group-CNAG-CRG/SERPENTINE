@@ -1,0 +1,156 @@
+
+
+```{bash eval=FALSE}
+
+# request interactive node
+# 8 threads, 256G mem, 10 hours
+interactive 8 256G 10:00:00 genD
+
+# activate conda env
+conda activate mpa
+R
+```
+
+Create the Seurat object for the B cell compartment.
+
+```{r eval=FALSE}
+
+library(Seurat) # packageVersion 5.1.0
+library(Matrix)
+library(tidyverse)
+library(cowplot)
+library(patchwork)
+library(arrow)
+theme_set(theme_cowplot())
+
+# set the project directory 
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Bcells/')
+data_dir <- 'data/'
+fig_dir <- 'figures/'
+
+# define the cell type of interest
+cur_celltype <- 'Bcells'
+
+
+# load the raw & normalized counts:
+X_raw <- Matrix::readMM(paste0(data_dir, cur_celltype, '_integrated_annotated_counts.mtx'))
+X_norm <- Matrix::readMM(paste0(data_dir, cur_celltype, '_integrated_annotated_lognorm.mtx'))
+
+# load the cell meta-data (.obs table)
+obs_df <- read.table(
+    paste0(data_dir, cur_celltype, '_integrated_annotated_obs.csv'), 
+    sep=',', row.names=1, header=TRUE
+)
+
+# load the gene meta-data (.var table)
+var_df <- read.table(
+    paste0(data_dir, cur_celltype, '_integrated_annotated_var.csv'), 
+    sep=',', row.names=1, header=TRUE
+)
+
+# add gene & cell names to the expression matrices:
+colnames(X_raw) <- rownames(obs_df)
+colnames(X_norm) <- rownames(obs_df)
+rownames(X_raw) <- rownames(var_df)
+rownames(X_norm) <- rownames(var_df)
+
+#----------------------------------------------------------#
+# Create the Seurat object
+#----------------------------------------------------------#
+
+seurat_obj <- Seurat::CreateSeuratObject(
+    counts = X_raw,
+    data = X_norm,
+    meta.data = obs_df,
+    assay = 'RNA',
+    min.features = 0,
+    min.cells = 0,
+    project = 'SERPENTINE'
+)
+dim(seurat_obj)
+
+# set VariableFeatures in the RNA assay
+variable_feats <- subset(var_df, highly_variable == 'True') %>% rownames()
+VariableFeatures(seurat_obj) <- variable_feats
+
+
+#----------------------------------------------------------#
+# Add embeddings to the Seurat object
+#----------------------------------------------------------#
+
+# load the embeddings:
+embedding_names <- c("X_pca_CellANOVA", "Cmat", "X_umap")
+for(cur_name in embedding_names){
+    print(cur_name)
+    emb <- as.matrix(read.table(
+        paste0(data_dir, cur_celltype, '_integrated_annotated_', cur_name,'.csv'), 
+        sep=',', row.names=1, header=TRUE
+    ))
+    rownames(emb) <- colnames(seurat_obj)
+    colnames(emb) <- paste0(cur_name, 1:ncol(emb))
+    seurat_obj@reductions[[cur_name]] <- Seurat::CreateDimReducObject(
+        emb, key = cur_name, assay = 'RNA'
+    )
+}
+
+#----------------------------------------------------------#
+# Add cell neighborhood graphs to the Seurat object
+#----------------------------------------------------------#
+
+graph_names <- c('distances', 'connectivities')
+for(cur_name in graph_names){
+    print(cur_name)
+    cur_graph <- Matrix::readMM(paste0(data_dir, cur_celltype, '_integrated_annotated_obsp_', cur_name,'.mtx'))
+    rownames(cur_graph) <- colnames(seurat_obj)
+    colnames(cur_graph) <- colnames(seurat_obj)
+    seurat_obj@graphs[cur_name] <- Seurat::as.Graph(cur_graph)
+}
+
+#----------------------------------------------------------#
+# Add CellANOVA corrected matrix as new Assays
+#----------------------------------------------------------#
+
+# # load the gene meta-data (.var table)
+# var_df_cnova <- read.table(
+#     paste0(data_dir, cur_celltype, '_integrated_annotated_CellANOVA_var.csv'), 
+#     sep=',', row.names=1, header=TRUE
+# )
+
+# # somehow does not work?
+# assay_names <- c('corrected', 'denoised', 'main_effect', 'trt_effect')
+# for(cur_name in assay_names){
+#     print(cur_name)
+#     cur_X <- as.matrix(arrow::read_feather(
+#         paste0(data_dir, cur_celltype, '_integrated_annotated_CellANOVA_', cur_name,'.feather')
+#     ))
+#     rownames(cur_X) <- var_df_cnova$gene
+#     colnames(cur_X) <- colnames(seurat_obj)
+#     seurat_obj[[cur_name]] <- SeuratObject::CreateAssay5Object(cur_X)
+# }
+
+#----------------------------------------------------------#
+# Remove the nCount and nFeature columns
+#----------------------------------------------------------# 
+
+tmp <- colnames(seurat_obj@meta.data)
+tmp <- tmp[!grepl('nCount', tmp)]
+tmp <- tmp[!grepl('nFeature', tmp)]
+seurat_obj@meta.data <- seurat_obj@meta.data[,tmp]
+
+#----------------------------------------------------------#
+# Fix / modify metadata columns as needed
+#----------------------------------------------------------# 
+
+# replace the greek letters in the lv2 annotations
+# the greek letters cause some problems when plotting in R
+seurat_obj$lv2 <- stringr::str_replace(seurat_obj$lv2, 'γδ', 'gd')
+seurat_obj$lv2 <- stringr::str_replace(seurat_obj$lv2, '/', '-')
+seurat_obj$lv2 <- stringr::str_replace(seurat_obj$lv2, '[+]', 'pos')
+
+table(stringr::str_replace(seurat_obj$lv2, '/', '-'))
+
+
+saveRDS(seurat_obj, file=  paste0("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/", cur_celltype, "/data/", cur_celltype, "_integrated_annotated_seurat.rds"))
+
+```
+

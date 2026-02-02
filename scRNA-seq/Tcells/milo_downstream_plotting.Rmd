@@ -1,0 +1,365 @@
+# launch an interactive node
+interactive 8 256G 12:00:00 genD
+
+# to launch:
+module load GCC
+conda activate mpa
+
+
+```{r eval=FALSE}
+
+# input handling packages
+library(yaml)
+library(assertthat)
+
+# data wrangling & plotting packages
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+library(crayon)
+
+# single-cell & data analysis packages
+library(Seurat)
+library(Matrix)
+
+# network analysis
+library(WGCNA)
+library(hdWGCNA)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+
+# interactive elements etc
+library(DT)
+library(IRdisplay)
+library(glue)
+library(plotly)
+
+# set the plotting theme
+theme_set(theme_cowplot())
+
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/')
+
+seurat_obj <- readRDS(file=  "/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcells_integrated_annotated_seurat.rds")
+
+
+fig_dir <- 'figures/'
+data_dir <- 'data/'
+
+
+# source helper functions
+source("/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/scripts/misc/helper_functions.R")
+source("/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/scripts/plotting/plotting_functions.R")
+
+
+# subset(seurat_obj@meta.data, Primary_tumor == 'Endometrial') %>% .$Tissue %>% table
+
+```
+
+Messing with hdWGCNA outputs scratchpad
+
+```{r eval=FALSE}
+
+meta_df <- seurat_obj@meta.data %>%
+    subset(
+        (Primary_tumor == "CRC") & 
+        (Tissue %in% c("Liver", "Lung")) & 
+        (Timepoint == '1')
+    )
+
+table(meta_df$Liver_met, meta_df$Tissue)
+
+tmp <- meta_df %>%
+    select(c(Patient, Tissue, Primary_tumor, Liver_met, Metastases_location)) %>%
+    distinct()
+
+table(tmp$Liver_met, tmp$Tissue)
+
+subset(tmp, Patient == 'Patient 29')
+
+seurat_hd <- readRDS('../../hdWGCNA/Tcells/results/Liver_T1/data/Liver_T1_hdWGCNA.rds')
+
+dim(seurat_hd)
+
+tmp <- seurat_hd@meta.data %>%
+    select(c(Replicate, Patient, Tissue, Primary_tumor, Timepoint, Liver_met)) %>%
+    distinct()
+
+
+```
+
+Re-load the miloR object 
+
+```{r eval=FALSE}
+
+# load the milo object
+config_df <- read.table("/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/config.tsv", sep='\t', header=1)
+
+
+cur_comparison <- 'CRC_Liver_T2_vs_T1'
+
+# subset the table to get the options:
+cur_config <- config_df %>% subset(
+  comparison == cur_comparison 
+)
+
+milo_obj <- readRDS("/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/results/CRC_Liver_T2_vs_T1/milo/CRC_Liver_T2_vs_T1_milo.rds")
+
+
+```
+
+Compare MiloR results from Liver T2 vs. T1 and Lung T2 vs. T1 
+
+```{r eval=FALSE}
+
+# load MiloR outputs
+
+da_results1 <- read.csv('/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/results/CRC_Liver_T2_vs_T1/milo/CRC_Liver_T2_vs_T1_milo_DA.csv')
+da_results2 <- read.csv('/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/results/CRC_Lung_T2_vs_T1/milo/CRC_Lung_T2_vs_T1_milo_DA.csv')
+
+# join the tables together for plotting
+da_df <- left_join(
+    da_results1, da_results2, 
+    by = 'Nhood'
+)
+
+
+# define settings for the plot
+effect_thresh <- 1.0
+signif_thresh <- 0.05
+effect_col1 <- "logFC.x"
+effect_col2 <- "logFC.y"
+signif_col1 <- "PValue.x"
+signif_col2 <- "PValue.y"
+consistent_color = 'darkgoldenrod1'
+inconsistent_color = 'dodgerblue'
+insignif_color = 'grey'
+plot_lines = TRUE
+line_color = 'lightgrey'
+plot_dpi = 300
+point_size = 2
+x_label = bquote("Liver met Treatment vs. Baseline, log"[2]~"(Fold Change)")
+y_label = bquote("Lung met Treatment vs. Baseline, log"[2]~"(Fold Change)")
+adjust_outliers = 0.999
+
+plot_df <- da_df %>% subset(cluster.x != "Mixed")
+
+# adjust outliers?
+if(!is.na(adjust_outliers)){
+    new_max <- max(
+        quantile(plot_df[,effect_col1], adjust_outliers),
+        quantile(plot_df[,effect_col2], adjust_outliers)
+    )
+    new_min <- min(
+        quantile(plot_df[,effect_col1], 1-adjust_outliers),
+        quantile(plot_df[,effect_col2], 1-adjust_outliers)
+    )    
+    plot_df[,effect_col1] <- ifelse(plot_df[,effect_col1] > new_max, new_max, plot_df[,effect_col1])
+    plot_df[,effect_col1] <- ifelse(plot_df[,effect_col1] < new_min, new_min, plot_df[,effect_col1])
+    plot_df[,effect_col2] <- ifelse(plot_df[,effect_col2] > new_max, new_max, plot_df[,effect_col2])
+    plot_df[,effect_col2] <- ifelse(plot_df[,effect_col2] < new_min, new_min, plot_df[,effect_col2])
+}
+
+
+# subset the dataframe to get genes that pass the p-val thresh and the
+signif_df <- subset(
+    plot_df, abs(get(effect_col1)) > effect_thresh & abs(get(effect_col2)) > effect_thresh & 
+    get(signif_col1) < signif_thresh & get(signif_col2) < signif_thresh
+)
+
+# neighborhoods that are signif in group1 or group2
+signif_g1 <- subset(plot_df, get(signif_col1) < signif_thresh & abs(get(effect_col1)) >= effect_thresh) %>% .$Nhood
+signif_g2 <- subset(plot_df, get(signif_col2) < signif_thresh & abs(get(effect_col2)) >= effect_thresh) %>% .$Nhood 
+
+# neighborhoods that are signif in both groups, either group, neither groups, etc.
+signif_shared <- intersect(signif_g1, signif_g2)
+signif_g1_only <- setdiff(signif_g1, signif_shared)
+signif_g2_only <- setdiff(signif_g2, signif_shared)
+signif_neither <- subset(plot_df,! Nhood %in% unique(c(signif_g1, signif_g2)) ) %>% .$Nhood
+signif_either <- union(signif_g1, signif_g2)
+
+# add the group labels:
+plot_df$plot_group <- ifelse(plot_df$Nhood %in% signif_shared, 'both', NA)
+plot_df$plot_group <- ifelse(plot_df$Nhood %in% signif_g1_only, 'g1', plot_df$plot_group)
+plot_df$plot_group <- ifelse(plot_df$Nhood %in% signif_g2_only, 'g2', plot_df$plot_group)
+plot_df$plot_group <- ifelse(plot_df$Nhood %in% signif_neither, 'neither', plot_df$plot_group)
+
+# are the directions consistent or inconsistent?
+plot_df$consistent <- ifelse(sign(plot_df[,effect_col1]) == sign(plot_df[,effect_col2]), 'consistent', 'inconsistent')
+plot_df$consistent <- ifelse(plot_df$Nhood %in% signif_either, plot_df$consistent, 'not signif')
+
+# define shapes and colors
+plot_shapes <- c(23, 24, 25, 21); names(plot_shapes) <- c('both', 'g1', 'g2', 'neither')
+plot_colors <- c(insignif_color, consistent_color, inconsistent_color) 
+names(plot_colors) <- c('not signif', 'consistent', 'inconsistent')
+
+# get plotting limits
+plot_lim <- max(c(abs(plot_df[,effect_col1]), abs(plot_df[,effect_col2])))
+
+
+
+# initialize the plot
+p <- plot_df %>%
+    ggplot(aes(x=get(effect_col1), y=get(effect_col2), fill = consistent, color = consistent))
+
+# plot the insignificant points
+p <- p + ggrastr::rasterise(
+        geom_point(
+            data = subset(plot_df, plot_group == 'neither'),
+            aes(shape=plot_group), 
+            alpha=0.5, size = point_size * 0.5,
+            color=insignif_color, fill=insignif_color
+        ), dpi=plot_dpi
+    ) 
+
+# plot the significant points
+p <- p + ggrastr::rasterise(
+        geom_point(
+            data = subset(plot_df, plot_group %in% c('g1', 'g2')),
+            aes(shape=plot_group), alpha=0.5, size = point_size * 0.75
+        ), dpi=plot_dpi
+    ) 
+
+# plot the significant points in both groups
+p <- p + ggrastr::rasterise(
+        geom_point(
+            data = subset(plot_df, plot_group == 'both'),
+            aes(shape=plot_group), alpha=1, size = point_size
+        ), dpi=plot_dpi
+    ) 
+
+# plot the lines 
+if(plot_lines){
+    p <- p + 
+        geom_vline(xintercept = -effect_thresh, color=line_color, linewidth=0.5, linetype='dashed') + 
+        geom_vline(xintercept = effect_thresh, color=line_color, linewidth=0.5, linetype='dashed') + 
+        geom_hline(yintercept = -effect_thresh, color=line_color, linewidth=0.5, linetype='dashed') +
+        geom_hline(yintercept = effect_thresh, color=line_color, linewidth=0.5, linetype='dashed')  
+}
+
+
+# add thematic elements 
+p <- p +
+    scale_shape_manual(values=plot_shapes, guide="none") + 
+    scale_color_manual(values = plot_colors, guide="none") + 
+    scale_fill_manual(values = plot_colors, guide="none") + 
+    xlim(c(-plot_lim, plot_lim)) + ylim(c(-plot_lim, plot_lim)) +
+    xlab(x_label) +
+    ylab(y_label) +
+    coord_fixed() + 
+    theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, linewidth=1),
+        plot.title = element_text(hjust=0.5)
+    ) 
+
+
+patch <- p + facet_wrap(~cluster.x, ncol=6) 
+
+
+pdf(paste0(fig_dir, 'test_DA_compare.pdf'), height=16, width=16)
+patch
+dev.off()
+
+
+
+
+#------------------------------------------------------
+# Summarize sectors
+#------------------------------------------------------
+
+sector_df <- plot_df %>%
+  mutate(
+    x_dir = case_when(
+      !!sym(effect_col1) >  effect_thresh ~ "pos",
+      !!sym(effect_col1) < -effect_thresh ~ "neg",
+      TRUE ~ "mid"
+    ),
+    y_dir = case_when(
+      !!sym(effect_col2) >  effect_thresh ~ "pos",
+      !!sym(effect_col2) < -effect_thresh ~ "neg",
+      TRUE ~ "mid"
+    ),
+    sector = paste0(x_dir, "_", y_dir)
+  )
+
+sector_summary <- sector_df %>%
+  group_by(cluster.x, sector) %>%
+  summarise(n = n(), .groups = "drop_last") %>%
+  mutate(
+    pct = n / sum(n)
+  ) %>%
+  ungroup()
+
+
+# set factor level:
+sector_summary$cluster.x <- factor(
+    as.character(sector_summary$cluster.x),
+    levels = unique(as.character(sector_summary$cluster.x))
+)
+
+
+
+
+# up-regulated
+p1 <- sector_summary %>% subset(sector %in% c('pos_mid', 'mid_pos', 'pos_pos')) %>%
+    ggplot(aes(x = cluster.x, y = sector, fill=pct)) + 
+    geom_tile() + 
+    geom_text(aes(label=round(100*pct)), vjust = 0.72, color='black') +
+    scale_fill_gradient(low='whitesmoke', high='navy') +
+    coord_fixed() +
+    RotatedAxis() +
+    theme(
+        axis.text.x = element_blank(),
+        axis.line.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank()
+    ) + xlab('') + ylab('')
+
+
+# down-regulated
+p2 <- sector_summary %>% subset(sector %in% c('neg_mid', 'mid_neg', 'neg_neg')) %>%
+    ggplot(aes(x = cluster.x, y = sector, fill=pct)) + 
+    geom_tile() + 
+    scale_fill_gradient(low='whitesmoke', high='seagreen') +
+    coord_fixed() +
+    theme(
+        axis.text.x = element_blank(),
+        axis.line.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank()
+    ) + xlab('') + ylab('')
+
+# opposite
+p3 <- sector_summary %>% subset(sector %in% c('pos_neg', 'neg_pos')) %>%
+    ggplot(aes(x = cluster.x, y = sector, fill=pct)) + 
+    geom_tile() + 
+    scale_fill_gradient(low='whitesmoke', high='black') +
+    coord_fixed() +
+    RotatedAxis()  + xlab('') + ylab('')
+
+patch <- (p1 / p2 / p3) + plot_layout(guides='collect')
+
+pdf(paste0(fig_dir, 'test_DA_compare_heatmap.pdf'), height=6, width=15)
+patch
+dev.off()
+
+
+
+#------------------------------------------------------
+# Diagnostic plot: Compare p-values and FDRs
+#------------------------------------------------------
+
+plot_df <- da_results1
+
+p <- ggplot(plot_df, aes(x=PValue, y=FDR)) + 
+    geom_point() +
+    geom_abline(color='grey', linetype='dashed', linewidth=0.5)
+
+pdf(paste0(fig_dir, 'test_DA_pval_vs_fdr.pdf'), height=6, width=6)
+p
+dev.off()
+
+```

@@ -1,0 +1,297 @@
+
+
+```{bash eval=FALSE}
+
+# request interactive node
+# 8 threads, 256G mem, 10 hours
+interactive 8 256G 10:00:00 genD
+
+# activate conda env
+conda activate mpa
+R
+```
+
+
+Create the Seurat object for the Myeloid compartment.
+
+```{r eval=FALSE}
+
+library(Seurat) # packageVersion 5.1.0
+library(Matrix)
+library(tidyverse)
+library(cowplot)
+library(patchwork)
+library(arrow)
+theme_set(theme_cowplot())
+
+# define the cell type of interest
+cur_celltype <- 'Myeloid'
+
+# set the project directory 
+setwd(paste0('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/', cur_celltype, '/'))
+data_dir <- 'data/'
+fig_dir <- 'figures/'
+
+# re-load the object
+seurat_obj <- readRDS(file=   paste0("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/", cur_celltype, "/data/", cur_celltype, "_integrated_annotated_seurat.rds"))
+
+# load the raw & normalized counts:
+X_raw <- Matrix::readMM(paste0(data_dir, cur_celltype, '_integrated_annotated_counts.mtx'))
+X_norm <- Matrix::readMM(paste0(data_dir, cur_celltype, '_integrated_annotated_lognorm.mtx'))
+
+# load the cell meta-data (.obs table)
+obs_df <- read.table(
+    paste0(data_dir, cur_celltype, '_integrated_annotated_obs.csv'), 
+    sep=',', row.names=1, header=TRUE
+)
+
+# load the gene meta-data (.var table)
+var_df <- read.table(
+    paste0(data_dir, cur_celltype, '_integrated_annotated_var.csv'), 
+    sep=',', row.names=1, header=TRUE
+)
+
+# add gene & cell names to the expression matrices:
+colnames(X_raw) <- rownames(obs_df)
+colnames(X_norm) <- rownames(obs_df)
+rownames(X_raw) <- rownames(var_df)
+rownames(X_norm) <- rownames(var_df)
+
+#----------------------------------------------------------#
+# Create the Seurat object
+#----------------------------------------------------------#
+
+seurat_obj <- Seurat::CreateSeuratObject(
+    counts = X_raw,
+    data = X_norm,
+    meta.data = obs_df,
+    assay = 'RNA',
+    min.features = 0,
+    min.cells = 0,
+    project = 'SERPENTINE'
+)
+dim(seurat_obj)
+
+# set VariableFeatures in the RNA assay
+variable_feats <- subset(var_df, highly_variable == 'True') %>% rownames()
+VariableFeatures(seurat_obj) <- variable_feats
+
+
+#----------------------------------------------------------#
+# Add embeddings to the Seurat object
+#----------------------------------------------------------#
+
+# load the embeddings:
+embedding_names <- c("X_pca_CellANOVA", "Cmat", "X_umap")
+for(cur_name in embedding_names){
+    print(cur_name)
+    emb <- as.matrix(read.table(
+        paste0(data_dir, cur_celltype, '_integrated_annotated_', cur_name,'.csv'), 
+        sep=',', row.names=1, header=TRUE
+    ))
+    rownames(emb) <- colnames(seurat_obj)
+    colnames(emb) <- paste0(cur_name, 1:ncol(emb))
+    seurat_obj@reductions[[cur_name]] <- Seurat::CreateDimReducObject(
+        emb, key = cur_name, assay = 'RNA'
+    )
+}
+
+#----------------------------------------------------------#
+# Add cell neighborhood graphs to the Seurat object
+#----------------------------------------------------------#
+
+graph_names <- c('distances', 'connectivities')
+for(cur_name in graph_names){
+    print(cur_name)
+    cur_graph <- Matrix::readMM(paste0(data_dir, cur_celltype, '_integrated_annotated_obsp_', cur_name,'.mtx'))
+    rownames(cur_graph) <- colnames(seurat_obj)
+    colnames(cur_graph) <- colnames(seurat_obj)
+    seurat_obj@graphs[cur_name] <- Seurat::as.Graph(cur_graph)
+}
+
+#----------------------------------------------------------#
+# Add CellANOVA corrected matrix as new Assays
+#----------------------------------------------------------#
+
+# # load the gene meta-data (.var table)
+# var_df_cnova <- read.table(
+#     paste0(data_dir, cur_celltype, '_integrated_annotated_CellANOVA_var.csv'), 
+#     sep=',', row.names=1, header=TRUE
+# )
+
+# # somehow does not work?
+# assay_names <- c('corrected', 'denoised', 'main_effect', 'trt_effect')
+# for(cur_name in assay_names){
+#     print(cur_name)
+#     cur_X <- as.matrix(arrow::read_feather(
+#         paste0(data_dir, cur_celltype, '_integrated_annotated_CellANOVA_', cur_name,'.feather')
+#     ))
+#     rownames(cur_X) <- var_df_cnova$gene
+#     colnames(cur_X) <- colnames(seurat_obj)
+#     seurat_obj[[cur_name]] <- SeuratObject::CreateAssay5Object(cur_X)
+# }
+
+#----------------------------------------------------------#
+# Remove the nCount and nFeature columns
+#----------------------------------------------------------# 
+
+tmp <- colnames(seurat_obj@meta.data)
+tmp <- tmp[!grepl('nCount', tmp)]
+tmp <- tmp[!grepl('nFeature', tmp)]
+seurat_obj@meta.data <- seurat_obj@meta.data[,tmp]
+
+#----------------------------------------------------------#
+# Fix / modify metadata columns as needed
+#----------------------------------------------------------# 
+
+# replace the greek letters in the lv2 annotations
+# the greek letters cause some problems when plotting in R
+seurat_obj$lv2 <- stringr::str_replace(seurat_obj$lv2, 'γδ', 'gd')
+seurat_obj$lv2 <- stringr::str_replace(seurat_obj$lv2, '/', '-')
+seurat_obj$lv2 <- stringr::str_replace(seurat_obj$lv2, '[+]', 'pos')
+
+table(stringr::str_replace(seurat_obj$lv2, '/', '-'))
+
+# add a simpified variable for the response 
+
+# # this totally isn't correct, what is wrong with me
+# seurat_obj$Response_simple <- ifelse(
+#     seurat_obj$Response == 'Progression Disease', 'Non-response', 'Response'
+# )
+# seurat_obj$Response_simple <- ifelse(seurat_obj$Response == 'Missing', 'Missing', seurat_obj$Response_simple)
+
+# # add a column for Liver met yes or no 
+# liver_mets <- c('Patient 01', 'Patient 02', 'Patient 03', 'Patient 05', 'Patient 07', 'Patient 08', 'Patient 10', 'Patient 14', 'Patient 16', 'Patient 18')
+
+# seurat_obj$Liver_met <- ifelse(seurat_obj$Patient %in% liver_mets, 'Yes', 'No')
+# seurat_obj$Liver_met <- ifelse(seurat_obj$dataset == 'Chen2024', NA, seurat_obj$Liver_met)
+
+saveRDS(seurat_obj, file=  paste0("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/", cur_celltype, "/data/", cur_celltype, "_integrated_annotated_seurat.rds"))
+
+
+```
+
+Scratch
+
+```{r eval=FALSE}
+
+
+library(yaml)
+library(tidyverse)
+library(Seurat)
+library(miloR)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+
+
+
+
+
+setwd(paste0('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/differential/', cur_celltype, '/'))
+
+
+
+# load helper functions
+source("scripts/misc/helper_functions.R")
+
+# load the plotting functions
+source("scripts/plotting/plotting_functions.R")
+
+
+# load the config file
+config <- yaml::read_yaml("config.yml")
+
+# load the config table:
+config_df <- read.table("config.tsv", sep='\t', header=1)
+
+cur_comparison <- "CRC_Primary_T2_vs_T1"
+
+# subset the table to get the options:
+cur_config <- config_df %>% subset(
+  comparison == cur_comparison 
+)
+
+# subset the table to get the options:
+cur_config <- config_df %>% subset(
+  comparison == cur_comparison 
+)
+
+# load the milo object based on the config file
+# milo_obj <- readRDS(opt$milo)
+milo_obj <- readRDS('results/CRC_Lung_T2_vs_T1/milo/CRC_Lung_T2_vs_T1_milo.rds')
+
+# get the group variable:
+group_var <- unique(cur_config$groupby)
+
+# condition info for the DEG comparison
+condition <- cur_config$condition[1]
+g1_name <- cur_config$group1[1]
+g2_name <- cur_config$group2[1] 
+
+# replicate info 
+replicate_col <- unique(cur_config$replicate)
+
+# settings for milo setup 
+milo_setup <- config$comparisons[[cur_comparison]]$milo_setup 
+k <- milo_setup$k 
+prop <- milo_setup$prop
+reduction <- milo_setup$reduction 
+dims <- milo_setup$dims
+mixed_prop <- milo_setup$mixed_prop
+
+# get the list of covariates
+covariates <- config$comparisons[[cur_comparison]]$covariates
+
+# TODO: CHECK THAT COVARIATES ARE PRESENT in the dataset
+
+# convert the reduction to uppercase
+reduction_milo <- toupper(reduction)
+
+# additional subsetting:
+subset_cols <- cur_config$subset_cols[1]
+subset_groups <- cur_config$subset_groups[1]
+
+# additional exclusions:
+exclude_cols <- cur_config$exclude_cols[1]
+exclude_groups <- cur_config$exclude_groups[1]
+
+# settings for milo setup 
+milo_setup <- config$comparisons[[cur_comparison]]$milo_setup 
+k <- milo_setup$k 
+prop <- milo_setup$prop
+reduction <- milo_setup$reduction 
+dims <- milo_setup$dims
+mixed_prop <- milo_setup$mixed_prop
+
+# get the list of covariates
+covariates <- config$comparisons[[cur_comparison]]$covariates
+
+
+#------------------------------------------------------
+# Plot the proportions in each group as a barplot
+#------------------------------------------------------
+
+pl_opt <- config$proportion_barplot 
+plot_width <- pl_opt$width
+plot_height <- pl_opt$height
+
+p <- ProportionBarPlot(
+  object = milo_obj,
+  group_var = group_var,
+  condition = condition,
+  g1_name = g1_name,
+  g2_name = g2_name,
+  replicate_col = replicate_col,
+  reps_remove = reps_remove,
+  subset_groups = subset_groups,
+  subset_cols = subset_cols
+) +  ggtitle(paste0(g1_name, ' vs. ', g2_name))
+
+
+pdf(paste0(outdir, cur_comparison, '_milo_proportions.pdf'), width=plot_width, height=plot_height)
+print(p)
+dev.off()
+
+
+```

@@ -1,0 +1,2479 @@
+# launch an interactive node
+interactive 8 256G 12:00:00 genD
+
+# to launch:
+module load GCC
+conda activate compact
+
+
+```{r eval=FALSE}
+
+# input handling packages
+library(yaml)
+library(assertthat)
+
+# data wrangling & plotting packages
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+library(crayon)
+
+# single-cell & data analysis packages
+library(Seurat)
+library(Matrix)
+
+# network analysis
+library(WGCNA)
+library(hdWGCNA)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+library(limma)
+
+# set the plotting theme
+theme_set(theme_cowplot())
+
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/hdWGCNA/Tcells/')
+
+# source helper functions
+source("scripts/helper_functions.R")
+source("scripts/plotting_functions.R")
+source("scripts/pseudobulk_functions.R")
+
+# load the configuration file:
+config_file <- "config.yml"
+config <- yaml::read_yaml(config_file)
+gen_opts <- config$general
+networks <- names(config$networks)
+
+fig_dir <- 'figures/'
+data_dir <- 'data/'
+
+# load the full Seurat object
+seurat_obj <- readRDS(config$seurat_path)
+
+networks <- c("Liver_T1", "Liver_T2", "Lung_T1", "Lung_T2", "Primary_T1", "Primary_T2")
+
+# load the individual seurat objects from each network analysis
+seurat_list <- lapply(networks, function(wgcna_name){
+    print(wgcna_name)
+    cur_obj <- readRDS(paste0(gen_opts$out_dir, '/', wgcna_name, '/', gen_opts$data_dir, '/', wgcna_name, '_hdWGCNA.rds'))
+    cur_obj
+})
+names(seurat_list) <- networks
+
+# load the TCAT weights:
+tcat_weights <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/TCAT_reference_weights.csv")
+rownames(tcat_weights) <- gsub('[-/]', '.', tcat_weights$X)
+tcat_weights <- tcat_weights[,-1]
+
+# re-load the MultiAssayExperiment object:
+mae <- readRDS(paste0(data_dir, "Tcells_pseudobulk_MAE.rds"))
+
+# re-load the MAE object w/ meta-module info:
+mae <- readRDS(paste0(data_dir, "Tcells_pseudobulk_MAE_metamodules.rds"))
+
+# re-load metamodules graphs:
+load(paste0(data_dir, "Tcells_pseudobulk_metamodules_graph.rda"))
+names(mm_list)
+
+#
+```
+
+single-cell Module Eigengene plots of selected modules (for paper main figure)
+
+```{r eval=FALSE}
+
+source('/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/scripts/plotting/plotting_functions.R')
+
+
+cur_net <- 'Liver_T1'
+cur_mod <- "Liver_T1_1"
+cur_mod <- "Liver_T1_9"
+cur_mod <- "Liver_T1_11"
+cur_mod <- "Liver_T1_13"
+
+cur_net <- 'Lung_T1'
+cur_mod <- 'Lung_T1_12'
+
+cur_seurat <- seurat_list[[cur_net]]
+MEs <- GetMEs(cur_seurat)
+cur_seurat$module <- MEs[,cur_mod]
+
+
+
+p1 <- FeatureEmbedding(
+  cur_seurat,
+  features = 'module',
+  reduction = 'X_umap',
+  raster=TRUE, dpi=300,
+  ncol = 4,
+  plot_max = 'q99',
+  plot_min = 0.05,
+  colfunc = viridis::magma,
+  rev_colors = TRUE
+) + ggtitle(cur_mod)
+
+pdf(paste0(fig_dir, 'featureplot_', cur_mod, '.pdf'), width=7, height=6, useDingbats=FALSE)
+p1
+dev.off()
+
+
+```
+
+Calculate pairwise overlap of all modules across 
+
+```{r eval=FALSE}
+
+library(GeneOverlap)
+
+
+# get table of modules from the individual hdWGCNA networks 
+modules <- do.call(rbind, lapply(networks, function(cur_net){
+    cur_obj <- SetActiveWGCNA(seurat_list[[cur_net]], wgcna_name = cur_net)
+    # cur_modules <- GetModules(cur_obj)[,1:3] %>% subset(module != 'grey') %>% 
+       #  mutate(module = droplevels(module))
+    cur_modules <- GetHubGenes(cur_obj, n_hubs = Inf) %>%
+        dplyr::rename(weight = kME)
+    rownames(cur_modules) <- 1:nrow(cur_modules)
+    cur_modules$network <- cur_net 
+    cur_modules
+}))
+table(modules$module)
+
+# set up the TCAT factors similar to the co-ex modules 
+tcat_df <- reshape2::melt(as.matrix(tcat_weights)) %>% 
+    dplyr::rename(gene_name = Var2, module = Var1, weight = value)
+tcat_df$color <- WGCNA::labels2colors(tcat_df$module)
+tcat_df$network <- "TCAT"
+
+modules <- rbind(modules, tcat_df[,colnames(modules)])
+
+write.csv(modules, file=paste0(data_dir, 'Tcell_modules_combined.csv'), quote=FALSE, row.names=FALSE)
+
+
+# keep only the top genes per factor ordered by value 
+n_genes <- 100
+modules <- modules %>% 
+    group_by(module) %>%
+    slice_max(n = n_genes, order_by = weight)
+
+
+
+
+modules1 <- modules
+modules2 <- modules
+
+
+# modules1 <- tcat_df %>% 
+#     group_by(module) %>%
+#     slice_max(n = n_genes, order_by = weight)
+# modules2 <- tcat_df %>% 
+#     group_by(module) %>%
+#     slice_max(n = n_genes, order_by = weight)
+
+
+mods1 <- unique(as.character(modules1$module)); mods1 <- mods1[mods1 != 'grey']
+mods2 <- unique(as.character(modules2$module)); mods2 <- mods2[mods2 != 'grey']
+
+
+genome.size <- length(union(modules1$gene_name, modules2$gene_name))
+
+# run overlaps between module gene lists and DEG lists:
+overlap_df <- do.call(rbind, lapply(mods1, function(cur_mod1){
+  cur_modules1_genes <- modules1 %>% subset(module == cur_mod1) %>% .$gene_name
+  cur_overlap_df <- do.call(rbind, lapply(mods2, function(cur_mod2){
+    print(paste0(cur_mod1, ' ', cur_mod2))
+    cur_modules2_genes <- modules2 %>% subset(module == cur_mod2) %>% .$gene_name
+    cur_overlap <- testGeneOverlap(newGeneOverlap(
+        cur_modules1_genes,
+        cur_modules2_genes,
+        genome.size=genome.size
+    ))
+    c(cur_overlap@odds.ratio, cur_overlap@pval, cur_overlap@Jaccard, length(cur_overlap@intersection))
+  })) %>% as.data.frame
+  colnames(cur_overlap_df) <- c('odds_ratio', 'pval', 'Jaccard', 'size_intersection')
+  cur_overlap_df$modules1 <- cur_mod1
+  cur_overlap_df$modules2 <- mods2
+
+  # module color:
+  #cur_overlap_df$color <- modules %>% subset(module == cur_mod) %>% .$color %>% unique
+  cur_overlap_df
+}))
+
+overlap_df$modules1 <- factor(as.character(overlap_df$modules1), levels=mods1)
+overlap_df$modules2 <- factor(as.character(overlap_df$modules2), levels=mods2)
+
+# adjust for multiple comparisons:
+overlap_df$fdr <- p.adjust(overlap_df$pval, method='fdr')
+
+# significance level:
+overlap_df$Significance <- gtools::stars.pval(overlap_df$fdr)
+overlap_df$Significance <- ifelse(
+  overlap_df$Significance == '.', '',
+  overlap_df$Significance
+)
+
+# hierarchical clustering of the module-module overlap matrix
+overlap_mat <- overlap_df %>% 
+    select(c(odds_ratio, modules1, modules2)) %>%
+    mutate(odds_ratio = ifelse(modules1 == modules2, 0, odds_ratio)) %>%
+    pivot_wider(values_from=odds_ratio, names_from=modules1) %>%
+    as.data.frame()
+rownames(overlap_mat) <- overlap_mat[,1] 
+overlap_mat <- as.matrix(overlap_mat[,2:ncol(overlap_mat)])
+dendro <- hclust(dist(overlap_mat))
+
+# order based on hierarchical clustering:
+overlap_df$modules1 <- factor(as.character(overlap_df$modules1), levels=dendro$labels[dendro$order])
+overlap_df$modules2 <- factor(as.character(overlap_df$modules2), levels=dendro$labels[dendro$order])
+
+
+overlap_df$pair <- paste0(as.character(overlap_df$modules1), '_', as.character(overlap_df$modules2))
+
+# save the pseudobulk module eigengene table:
+write.csv(overlap_df, file=paste0(data_dir, 'module_pairwise_overlap.csv'), quote=FALSE, row.names=FALSE)
+
+
+
+# plot the results as a heatmap:
+maxval <- 100
+plot_df <- overlap_df
+plot_df$odds_ratio <- ifelse(plot_df$odds_ratio > maxval, maxval, plot_df$odds_ratio)
+plot_df$textcolor <- ifelse(plot_df$odds_ratio > 0.7*maxval, 'white', 'black')
+plot_df$size_intersection <- ifelse(plot_df$fdr < 0.05, plot_df$size_intersection, NA)
+
+
+p1 <- plot_df %>%
+  ggplot(aes(x=modules1, y=modules2, fill=odds_ratio)) +
+  geom_tile() +
+  geom_text(label=plot_df$Significance, vjust = 0.72, color=plot_df$textcolor) +
+  scale_fill_gradient(low='white', high='navy') +
+  RotatedAxis() +
+  labs(fill = 'Odds ratio') +
+  theme(
+    panel.border = element_rect(fill=NA, color='black', size=1),
+    axis.line.x = element_blank(),
+    axis.line.y = element_blank(),
+    axis.text.y = element_text(size=6),
+    axis.text.x = element_text(size=6)
+
+  ) +
+  coord_equal() + xlab('') + ylab('')
+
+pdf(paste0(fig_dir, 'module_pairwise_overlap.pdf'), width=16, height=16)
+print(p1) 
+dev.off()
+
+
+```
+
+Module alluvial plot (not used in the final paper)
+
+```{r eval=FALSE}
+
+library(ggalluvial)
+library(ggrastr)
+
+
+target_mod <- "Liver_T1_1"
+
+
+modules1 <- subset(modules, network == 'Liver_T1') %>% mutate(module = droplevels(module))
+modules2 <- subset(modules, network == 'Liver_T2') %>% mutate(module = droplevels(module))
+
+df <- dplyr::inner_join(modules1, modules2, by = 'gene_name') %>%
+  mutate(is_target = ifelse(module.x == target_mod, "Highlight", "Other")) %>%
+  mutate(is_target = factor(is_target, levels = c("Other", "Highlight"))) %>%
+  arrange(is_target)
+
+# 2. Build the plot
+p <- ggplot(df,
+       aes(axis1 = module.x, axis2 = module.y, y = 1)) + # y=1 counts genes
+  geom_alluvium(aes(fill = is_target, alpha = is_target), 
+                width = 1/12, knot.pos = 0.4) +
+  geom_stratum(width = 1/12, fill = "grey90", color = "grey30") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3) +
+  
+  # 3. Custom Scales to make it "Pop"
+  scale_fill_manual(values = c("Highlight" = "#E64B35", "Other" = "grey80")) +
+  scale_alpha_manual(values = c("Highlight" = 0.9, "Other" = 0.2)) +
+  
+  theme_minimal() +
+  labs(title = paste("Gene Redistribution: Focus on", target_mod),
+       x = "Network Transition",
+       y = "Gene Count") +
+  theme(legend.position = "none", # Hide legend if the color is self-explanatory
+        panel.grid = element_blank())
+
+pdf(paste0(fig_dir, 'module_compare_alluvial1.pdf'), width=10, height=10)
+print(p) 
+dev.off()
+
+
+# 1. Identify the Top 25 Hub Genes to label
+top_hubs <- df %>%
+  filter(module.x == target_mod) %>%
+  slice_max(order_by = weight.x, n = 25) %>%
+  pull(gene_name)
+
+# 2. Plotting
+p <- ggplot(df,
+       aes(axis1 = module.x, axis2 = module.y, y = 1)) +
+  # Flow layer
+  rasterise(
+    geom_alluvium(
+      aes(fill = is_target, alpha = is_target, group = gene_name),
+      width = 1/12, knot.pos = 0.4
+    ), dpi = 300
+  ) +
+  # Strata boxes
+  geom_stratum(width = 1/12, fill = "white", color = "grey30") +
+  # Labels for modules (Strata)
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), 
+            size = 2.5, discern = TRUE) +
+  
+  # FIXED LABEL LOGIC: 
+  # We use 'stat_low_level' or simply filter the transformed lodes
+  geom_text_repel(
+    aes(label = ifelse(gene_name %in% top_hubs, gene_name, NA)),
+    stat = "alluvium",
+    nudge_x = 0.15,
+    size = 2.5,
+    direction = "y",
+    hjust = 0,
+    segment.size = 0.2,
+    max.overlaps = Inf
+  ) +
+  
+  # Scales
+  scale_alpha_manual(values = c("Other" = 0.15, "Highlight" = 1)) +
+  scale_fill_manual(values = c("Highlight" = "darkgrey", "Other" = "grey80")) +
+  
+  theme_minimal() +
+  labs(title = paste("Fate of", target_mod, "Genes Post-Treatment"),
+       x = "Transition (T1 -> T2)", y = "Gene Count") +
+  theme(legend.position = "right", 
+        panel.grid = element_blank(),
+        axis.text.y = element_blank())
+
+pdf(paste0(fig_dir, 'module_compare_alluvial.pdf'), width=10, height=10)
+print(p) 
+dev.off()
+
+
+
+# 2. Plotting
+p <- ggplot(df,
+       aes(axis1 = module.x, axis2 = module.y, y = 1)) +
+  # Flow layer
+  rasterise(
+    geom_alluvium(
+      aes(fill = is_target, alpha = is_target, group = gene_name),
+      width = 1/12, knot.pos = 0.4
+    ), dpi = 300
+  ) +
+  # Strata boxes
+  geom_stratum(width = 1/12, fill = "white", color = "grey30") +
+  # Labels for modules (Strata)
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), 
+            size = 2.5, discern = TRUE) +
+
+  # Scales
+  scale_alpha_manual(values = c("Other" = 0.15, "Highlight" = 1)) +
+  scale_fill_manual(values = c("Highlight" = "darkgrey", "Other" = "grey80")) +
+  
+  theme_minimal() +
+  labs(title = paste("Fate of", target_mod, "Genes Post-Treatment"),
+       x = "Transition (T1 -> T2)", y = "Gene Count") +
+  theme(legend.position = "right", 
+        panel.grid = element_blank(),
+        axis.text.y = element_blank())
+
+pdf(paste0(fig_dir, 'module_compare_alluvial_small_nolabel.pdf'), width=4, height=6)
+print(p) 
+dev.off()
+
+
+```
+
+Part 0: Lineage-wide pseudo-bulks, for downstream comparison with Tumor cells 
+
+```{r eval=FALSE}
+
+
+
+```
+
+Part 1: Exploratory analysis of Pseudobulk data
+
+1. Calculate the pseudobulk representation of the dataset
+2. Plot QC metrics at the pseudo-bulk level 
+3. Perform PCA and PCA regression 
+4. Visualize key variables on the PCA embedding 
+
+```{r eval=FALSE}
+
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+
+# extract the counts matrix & cell-level meta-data from the Seurat object
+X <- GetAssayData(seurat_obj, layer='counts')
+meta <- seurat_obj@meta.data
+
+# create a pseudo-bulk SummarizedExperiment object
+se <- AggregatePseudobulk(
+    X, meta, 
+    replicate_col = "Replicate", 
+    group_col = "annotation"
+)
+table(colData(se)$annotation)
+
+# normalize the pseudobulk SummarizedExperiment
+se <- NormalizeCounts(
+    se, 
+    method = 'VST',
+    assay_name = 'counts'
+)
+
+#---------------------------------------------------------#
+# Visualize QC metrics
+#---------------------------------------------------------#
+
+plot_df <- as.data.frame(colData(se))
+
+p <- plot_df %>% 
+    ggplot(aes(x = nUMI, y = nFeatures)) + 
+    ggrastr::rasterise(geom_point(aes(color = Tissue, size = nCells)), dpi=300) + 
+    RotatedAxis() +
+    scale_x_continuous(labels = scales::comma) +
+    scale_y_continuous(labels = scales::comma) +
+    theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth=1,color='black', fill=NA),
+        panel.grid.major.y = element_line(linewidth=0.25, color='lightgrey'),
+        panel.grid.major.x = element_line(linewidth=0.25, color='lightgrey'),
+        strip.text = element_text(face='bold', size=8),
+        plot.title = element_text(hjust=0.5)
+    ) + 
+    ggtitle("Pseudobulk nUMI detected vs. nFeatures detected")
+
+
+patch <- p + facet_wrap(~annotation, ncol=6) 
+pdf(paste0(fig_dir, 'Pseudobulk_QC_nUMI_vs_nFeatures.pdf'), width=16, height=8)
+print(patch) 
+dev.off()
+
+# calculate density 
+plot_df$density <- plot_df$nFeatures / nrow(se)
+
+p <- plot_df %>% 
+    ggplot(aes(x = nCells, y = density)) + 
+    ggrastr::rasterise(geom_point(aes(color = Tissue, size = nCells)), dpi=300) + 
+    RotatedAxis() +
+    scale_x_continuous(labels = scales::comma) +
+    scale_y_continuous(labels = scales::comma) +
+    theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth=1,color='black', fill=NA),
+        panel.grid.major.y = element_line(linewidth=0.25, color='lightgrey'),
+        panel.grid.major.x = element_line(linewidth=0.25, color='lightgrey'),
+        strip.text = element_text(face='bold', size=8)
+    )
+
+
+patch <- p + facet_wrap(~annotation, ncol=6) 
+pdf(paste0(fig_dir, 'Pseudobulk_QC_nCells_vs_Sparsity.pdf'), width=16, height=8)
+print(patch) 
+dev.off()
+
+
+
+#---------------------------------------------------------#
+# PCA
+#---------------------------------------------------------#
+
+se <- PseudobulkPCA(
+    se,
+    assay_name = 'VST',
+    n_components = 30
+)
+
+p <- PlotPCAEmbedding(
+    se,
+    color_by = 'Tissue',
+)
+
+pdf(paste0(fig_dir, 'Pseudobulk_PCA_Tissue.pdf'), width=8, height=6)
+print(p) 
+dev.off()
+
+p <- PlotPCAEmbedding(
+    se,
+    color_by = 'annotation',
+)
+
+pdf(paste0(fig_dir, 'Pseudobulk_PCA_cluster.pdf'), width=12, height=5)
+print(p) 
+dev.off()
+
+p <- PlotPCAFeatures(
+    se,
+    feature = 'nCells',
+    adjust_outliers = 0.95
+) + scale_color_viridis_c()
+
+pdf(paste0(fig_dir, 'Pseudobulk_PCA_nCells.pdf'), width=7, height=5)
+print(p) 
+dev.off()
+
+p <- PlotPCAFeatures(
+    se,
+    feature = 'IL7R',
+    assay_name = 'VST'
+) 
+
+pdf(paste0(fig_dir, 'Pseudobulk_PCA_IL7R.pdf'), width=7, height=5)
+print(p) 
+dev.off()
+
+p1 <- PlotPCAFeatures(se, feature = 'nUMI') 
+p2 <- PlotPCAFeatures(se, feature = 'nFeatures') 
+
+patch <- p1 + p2
+
+pdf(paste0(fig_dir, 'Pseudobulk_PCA_QC_embedding.pdf'), width=11, height=5)
+print(patch) 
+dev.off()
+
+#---------------------------------------------------------#
+# PCA Regression
+#---------------------------------------------------------#
+
+se <- PCRegression(
+    se,
+    covariates = c(
+        'annotation', "Tissue", "Timepoint",
+        "nCells", "nUMI", "nFeatures"
+    ),
+    overwrite = TRUE
+)
+
+plot_df <- metadata(se)[["PCA"]]$regression 
+
+
+p <- plot_df %>% 
+    ggplot(aes(x = component, y = covariate)) + 
+    geom_point(
+        aes(size = -log10(fdr), color=adj_R2)
+    ) + 
+    geom_point(
+        data = subset(plot_df, fdr < 0.05),
+        aes(size = -log10(fdr)), color = 'black', shape = 21
+    ) +
+    coord_fixed() + 
+    scale_color_gradient2(low='seagreen', mid = 'whitesmoke', high='darkorchid4') +
+    theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth = 1, color = 'black', fill = NA),
+        panel.grid.major.y = element_line(linewidth = 0.25, color = 'lightgrey'),
+        panel.grid.major.x = element_line(linewidth = 0.25, color = 'lightgrey'),
+        plot.title = element_text(hjust = 0.5) 
+    ) +
+    scale_x_continuous(limits = c(1, max(plot_df$component))) + 
+    xlab('Principal Component') + ylab('') 
+
+pdf(paste0(fig_dir, 'Pseudobulk_PCA_regression.pdf'), width=12, height=6)
+print(p) 
+dev.off()
+
+
+```
+
+Part 2: Pseudobulk analysis with filtering 
+
+1. Calculate the pseudobulk representation of the dataset
+2. Filter the dataset 
+   - Only keep Liver and Lung tissues
+   - Only keep patients with both timepoints
+   - Remove low-quality pseudobulks
+
+Calculate pseudobulk MEs 
+
+```{r eval=FALSE}
+
+seurat_obj$Patient_Timepoint <- paste0(seurat_obj$Patient, ':T', seurat_obj$Timepoint)
+
+# extract the counts matrix & cell-level meta-data from the Seurat object
+X <- GetAssayData(seurat_obj, layer='counts')
+meta <- seurat_obj@meta.data
+
+# create a pseudo-bulk SummarizedExperiment object
+se <- AggregatePseudobulk(
+    X, meta, 
+    replicate_col = "Patient_Timepoint", 
+    group_col = "annotation",
+    min_cells = 50
+)
+
+# select groups of interest
+se <- se[,
+    (colData(se)$Tissue %in% c('Liver', 'Lung')) &
+    (colData(se)$Timepoint %in% c(1,2)) &
+    (colData(se)$Primary_tumor == 'CRC')
+]
+
+# exclude patients that don't have both timepoints
+patients_keep <- intersect(
+    colData(se) %>% subset(Timepoint == 1) %>% .$Patient %>% unique,
+    colData(se) %>% subset(Timepoint == 2) %>% .$Patient %>% unique
+)
+
+se <- se[, colData(se)$Patient %in% patients_keep]
+table(colData(se)$Tissue, colData(se)$Timepoint)
+
+# Remove genes with zero variance
+X_pb <- assays(se)$counts
+good_genes <- names(which(apply(X_pb, 1, sd) != 0))
+se <- se[good_genes,]
+
+# normalize the pseudobulk SummarizedExperiment
+se <- NormalizeCounts(
+    se, 
+    method = 'VST',
+    assay_name = 'counts'
+)
+
+#---------------------------------------------------------#
+# Visualize QC metrics
+#---------------------------------------------------------#
+
+plot_df <- as.data.frame(colData(se))
+
+p <- plot_df %>% 
+    ggplot(aes(x = nUMI, y = nFeatures)) + 
+    ggrastr::rasterise(geom_point(aes(color = Tissue, size = nCells)), dpi=300) + 
+    RotatedAxis() +
+    scale_x_continuous(labels = scales::comma) +
+    scale_y_continuous(labels = scales::comma) +
+    theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth=1,color='black', fill=NA),
+        panel.grid.major.y = element_line(linewidth=0.25, color='lightgrey'),
+        panel.grid.major.x = element_line(linewidth=0.25, color='lightgrey'),
+        strip.text = element_text(face='bold', size=8),
+        plot.title = element_text(hjust=0.5)
+    ) + 
+    ggtitle("Pseudobulk nUMI detected vs. nFeatures detected")
+
+pdf(paste0(fig_dir, 'Pseudobulk_filtered_QC_nUMI_vs_nFeatures.pdf'), width=7, height=5)
+print(p) 
+dev.off()
+
+
+#---------------------------------------------------------#
+# PCA
+#---------------------------------------------------------#
+
+se <- PseudobulkPCA(
+    se,
+    assay_name = 'VST',
+    n_components = 30,
+    overwrite = TRUE
+)
+
+p <- PlotPCAEmbedding(
+    se,
+    color_by = 'Tissue',
+)
+
+pdf(paste0(fig_dir, 'Pseudobulk_filtered_PCA_Tissue.pdf'), width=8, height=6)
+print(p) 
+dev.off()
+
+p <- PlotPCAEmbedding(
+    se,
+    color_by = 'annotation',
+    components = c("PC3", "PC4")
+)
+
+pdf(paste0(fig_dir, 'Pseudobulk_filtered_PCA_cluster.pdf'), width=12, height=5)
+print(p) 
+dev.off()
+
+p <- PlotPCAEmbedding(
+    se,
+    color_by = 'Patient_Timepoint',
+)
+
+pdf(paste0(fig_dir, 'Pseudobulk_filtered_PCA_Replicate.pdf'), width=12, height=5)
+print(p) 
+dev.off()
+
+#---------------------------------------------------------#
+# PCA Regression
+#---------------------------------------------------------#
+
+se <- PCRegression(
+    se,
+    covariates = c(
+        'Patient', 'annotation', "Tissue", "Timepoint",
+        "nCells", "nUMI", "nFeatures"
+    ),
+    overwrite = TRUE
+)
+
+plot_df <- metadata(se)[["PCA"]]$regression 
+
+
+p <- plot_df %>% 
+    ggplot(aes(x = component, y = covariate)) + 
+    geom_point(
+        aes(size = -log10(fdr), color=adj_R2)
+    ) + 
+    geom_point(
+        data = subset(plot_df, fdr < 0.05),
+        aes(size = -log10(fdr)), color = 'black', shape = 21
+    ) +
+    coord_fixed() + 
+    scale_color_gradient2(low='seagreen', mid = 'whitesmoke', high='darkorchid4') +
+    theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth = 1, color = 'black', fill = NA),
+        panel.grid.major.y = element_line(linewidth = 0.25, color = 'lightgrey'),
+        panel.grid.major.x = element_line(linewidth = 0.25, color = 'lightgrey'),
+        plot.title = element_text(hjust = 0.5) 
+    ) +
+    scale_x_continuous(limits = c(1, max(plot_df$component))) + 
+    xlab('Principal Component') + ylab('') 
+
+pdf(paste0(fig_dir, 'Pseudobulk_filtered_PCA_regression.pdf'), width=12, height=6)
+print(p) 
+dev.off()
+
+
+```
+
+On the filtered SE object from the previous block, calculate pseudobulk module eigengenes 
+and pseudobulk decoupleR scores for each of the hdWGCNA co-expression 
+modules 
+
+```{r eval=FALSE}
+
+modules <- read.csv(file=paste0(data_dir, 'Tcell_modules_combined.csv'))
+mods <- as.character(unique(modules$module))
+mods <- mods[!grepl("Poor|Doublet", mods)]
+modules <- subset(modules, module %in% mods)
+
+# calculate MEs for each of these modules
+se_modules <- PseudobulkModuleEigengenes(
+    se, 
+    modules = modules,
+    assay_name = "VST",
+    new_assay_name = "MEs"
+)
+
+
+#---------------------------------------------------------#
+# Calculate pseudo-bulk decoupleR ULM scores
+#---------------------------------------------------------#
+
+library(decoupleR)
+
+# # load the top hub genes per module
+# n_hubs <- 100
+# hub_df <- do.call(rbind, lapply(networks, function(cur_net){
+#     cur_obj <- SetActiveWGCNA(seurat_list[[cur_net]], wgcna_name = cur_net)
+#     cur_modules <- GetHubGenes(cur_obj, n_hubs = n_hubs) %>% 
+#         subset(module != 'grey') %>% 
+#         dplyr::mutate(module = droplevels(module)) %>%
+#         dplyr::group_by(module) %>%
+#         dplyr::slice_max(n=n_hubs, order_by=kME) %>%
+#         dplyr::rename(weight = kME)
+      
+#     cur_modules$network <- cur_net 
+#     cur_modules
+# }))
+
+# define the expression matrix to use
+X <- assays(se)$VST
+
+signature_df <- data.frame()
+for(cur_net in unique(modules$network)){
+
+  print(cur_net)
+  cur_df <- subset(modules, network == cur_net) 
+
+  cur_signature_df <- decoupleR::run_ulm(
+    mat = X,
+    net = cur_df,
+    .source = 'module',
+    .target = 'gene_name',
+    .mor = 'weight'
+  )
+
+  cur_signature_df$network <- cur_net
+  signature_df <- rbind(signature_df, cur_signature_df)
+
+}
+
+# cast from long to wide:
+signature_mat <- signature_df %>% 
+    dplyr::select(source, condition, score) %>%
+    tidyr::pivot_wider(
+        names_from = condition,
+        values_from = score,
+        values_fill = 0
+    ) %>%
+    as.data.frame()
+rownames(signature_mat) <- signature_mat$source
+signature_mat <- as.matrix(signature_mat[,-1])
+
+# re-order to match the se_modules object
+signature_mat <- signature_mat[rownames(se_modules), colnames(se_modules)]
+
+# add to the se_modules object
+assays(se_modules)$decoupleR_ULM <- signature_mat
+
+#---------------------------------------------------------#
+# Create a MultiAssayExperiment (MAE) object 
+# and save the results
+#---------------------------------------------------------#
+
+mae <- MultiAssayExperiment(
+    experiments = list(
+        RNA = se,
+        modules = se_modules
+    ),
+    colData = colData(se)
+)
+
+saveRDS(mae, paste0(data_dir, "Tcells_pseudobulk_MAE.rds"))
+
+```
+
+
+Perform pseudo-bulk differential module eigengene analysis
+
+```{r eval=FALSE}
+
+
+modules <- read.csv(file=paste0(data_dir, 'Tcell_modules_combined.csv')) %>% 
+    subset(network != 'TCAT')
+mods <- as.character(unique(modules$module))
+mods <- mods[!grepl("Poor|Doublet", mods)]
+modules <- subset(modules, module %in% mods) 
+
+
+# subset by Tissue 
+assay_use <- 'decoupleR_ULM'
+
+# update the timepoint column so limma doesn't freak out
+colData(mae)$TP <-paste0("T", as.character(colData(mae)$Timepoint))
+
+# define the current MAE object by subsetting the Tissue:
+cur_tissue <- 'Liver'; networks_test <- c('Liver_T1', 'Liver_T2')
+cur_tissue <- 'Lung'; networks_test <- c('Lung_T1', 'Lung_T2')
+
+
+cur_mae <- mae[, colData(mae)$Tissue == cur_tissue]
+
+# Make a test comparison between 
+meta <- colData(cur_mae)
+
+# define the current cluster
+clusters <- unique(colData(cur_mae)$annotation)
+
+# which modules to 
+modules_test <- modules[grepl(paste0(cur_tissue, "_T1"), modules$module),] %>% .$module %>% as.character() %>% unique()
+
+dme_df <- data.frame()
+for(cur_cluster in clusters){
+
+    print(cur_cluster)
+
+    pb_keep <- meta %>% subset(
+        (annotation == cur_cluster) 
+    )
+
+    # get the modules that are expressed at a high enough level in this cluster:
+    modules_expressed <- marker_df %>% 
+        subset((group == cur_cluster) & (avg_log2FC > 0) & (module %in% modules_test)) %>% .$module
+
+    if(length(modules_expressed) == 0){
+        print("no modules highly expressed, skipping")
+        next
+    }
+
+    # subset the MAE object
+    cur <- cur_mae[,rownames(pb_keep)]
+
+    # get the module eigengene matrix:
+    MEs <- assays(experiments(cur)$modules)[[assay_use]]
+    MEs <- MEs[modules_expressed,]
+
+    # set up the design matrix:
+    condition_factor <- factor(pb_keep$TP, levels = c("T1", "T2"))
+    patient_factor <- factor(pb_keep$Patient)
+    n_cells_scaled  <- as.numeric(scale(log10(pb_keep$nCells))) # Scale to keep coefficients comparable
+    condition_vec <- ifelse(condition_factor == 'T1', 0, 1)
+
+    # # see if we need to skip:
+    if(any(table(condition_factor) < 3)){
+        print(paste0("Skipping ", cur_cluster, ' ...'))
+        next
+    }
+
+    # design <- model.matrix(~ 0 + condition_factor)
+    design <- model.matrix(~ patient_factor + condition_factor + n_cells_scaled)
+
+    # Rename the columns for cleaner output
+    colnames(design) <- gsub("condition_factor", "", colnames(design))
+
+    # Display the design matrix (optional, but helpful for verification)
+    head(design)
+
+    # CHECK: Is the design matrix estimable?
+    check_est <- limma::nonEstimable(design)
+
+    if(!is.null(check_est)){
+        cat(paste0("\nSkipping ", cur_cluster, " - Collinearity detected in: ", 
+                paste(check_est, collapse=", "), "\n"))
+        next 
+    }
+
+    # Fit the linear model to the transposed ME data
+    # Since MEs are continuous, scaled values, no voom transformation is needed.
+    fit <- lmFit(MEs, design)
+    fit <- tryCatch({
+        eBayes(fit, robust = TRUE, trend = TRUE)
+    }, error = function(e){
+        cat(paste0("\nSkipping ", cur_cluster, " - eBayes failed: ", e$message, "\n"))
+        return(NULL)
+    })
+    if (is.null(fit)){ next}
+
+    results <- topTable(fit, 
+                    coef = ncol(design), 
+                    number = Inf, 
+                    sort.by = "P",
+                    adjust.method = "BH")
+
+    # add comparison info 
+    results$module <- rownames(results)
+    results$cluster <- cur_cluster
+    rownames(results) <- 1:nrow(results)
+
+    dme_df <- rbind(dme_df, results)
+
+}
+
+# calculate the global adjusted p-value
+dme_df$global_adj_pval <- p.adjust(dme_df$P.Value, method = "BH")
+
+# how many significant hits are there?
+signif_df <- subset(dme_df, P.Value < 0.05) 
+
+subset(dme_df, P.Value < 0.05) %>% dim()
+subset(dme_df, adj.P.Val < 0.05) %>% dim()
+subset(dme_df, adj.P.Val < 0.1) %>% dim()
+subset(dme_df, global_adj_pval < 0.05) %>% dim()
+
+subset(dme_df, adj.P.Val < 0.05) %>% .$module %>% unique()
+
+subset(dme_df, module == 'Liver_T1_1')
+
+# write the results:
+write.csv(dme_df, file = paste0(data_dir, 'Pseudobulk_DMEs_', cur_tissue, '_expressed_only.csv'), quote=FALSE)
+
+
+
+
+plot_df <- subset(dme_df, module == "Liver_T1_1") 
+p <- plot_df %>%
+    ggplot(aes(x=logFC, y=-log10(adj.P.Val))) + 
+    geom_point() + 
+    geom_hline(yintercept=-log10(0.05), linetype='dashed', color='grey') + 
+    geom_text_repel(aes(label = cluster))
+
+
+
+pdf(paste0(fig_dir, 'Pseudobulk_DMEs_test_volcano.pdf'), width=6, height=6)
+print(p) 
+dev.off()
+
+
+
+
+
+
+
+
+# 1. Scale AveExpr per module across all clusters
+dme_plot_df <- dme_df %>%
+  group_by(module) %>%
+  mutate(
+    # Z-score to center the data
+    z_expr = as.numeric(scale(AveExpr)),
+    # Rescale 0-1 for the 'size' aesthetic
+    scaled_expr = (z_expr - min(z_expr)) / (max(z_expr) - min(z_expr))
+  ) %>%
+  ungroup()
+
+# set anything greater than the max_val to the max_val
+max_val <- 3 
+dme_plot_df$logFC <- ifelse(abs(dme_plot_df$logFC) > max_val, max_val * sign(dme_plot_df$logFC), dme_plot_df$logFC)
+
+p <- dme_plot_df %>%
+    ggplot() + 
+    geom_point(
+        aes(x = cluster, y = module, color = logFC, size = scaled_expr)
+    ) + 
+    geom_point(
+        data = subset(dme_plot_df, adj.P.Val < 0.1),
+        aes(x = cluster, y = module, size = scaled_expr), 
+        color = 'black', shape=21, fill = NA, stroke = 0.5
+    ) + 
+    scale_color_gradient2(low = 'dodgerblue', mid = 'whitesmoke', high = 'darkgoldenrod1') + 
+    coord_fixed() + RotatedAxis() + 
+    theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth=1,color='black', fill=NA),
+      #  panel.grid.major.y = element_line(linewidth=0.25, color='lightgrey'),
+        plot.title = element_text(hjust=0.5),
+        strip.background = element_blank(),
+        strip.text = element_text(face='bold')
+    ) + xlab('') + ylab('')
+
+
+pdf(paste0(fig_dir, 'Pseudobulk_DMEs_', cur_tissue, '_Timepoint_', assay_use,'_dotplot.pdf'), width=8, height=8)
+print(p) 
+dev.off()
+
+
+
+# volcano plot code (not used)
+# p <- dme_df %>% 
+#     ggplot(aes(x = logFC, y = -log10(P.Value))) + 
+#     geom_point(aes(color = cluster)) +
+#     geom_hline(yintercept = -log10(0.05), linetype='dashed', linewidth=0.5, color='grey') 
+#     #xlim(c(-1,1))
+
+# patch <- p + facet_wrap(~cluster, ncol=6, scales='free') + NoLegend()
+
+# pdf(paste0(fig_dir, 'test_pb_filtered_DMEs_Liver_Timepoint_', assay_use,'_fdr.pdf'), width=8, height=8)
+# print(p) 
+# dev.off()
+
+#---------------------------------------------------------#
+# Box and whisker plot of one of the top hits 
+#---------------------------------------------------------#
+
+subset(dme_df, P.Value < 0.05)
+
+cur_mod <- "Liver_T1_13" # Tgd-v1
+
+plot_df <- as.data.frame(colData(mae))
+MEs <- assays(experiments(mae)$modules)[[assay_use]]
+
+plot_df$value <- as.numeric(MEs[cur_mod, rownames(plot_df)])
+
+p <- plot_df %>%
+    subset(Tissue == 'Liver') %>%
+    ggplot(aes(x = annotation , y = value)) + 
+    geom_boxplot(
+        aes(fill = as.factor(Timepoint)),
+        outlier.shape = NA,
+        alpha = 0.25,
+        width = 0.5,
+    ) +
+    # ggrastr::rasterise(ggbeeswarm::geom_quasirandom(
+    #     aes(color=as.factor(Timepoint)),
+    #     method = 'pseudorandom',
+    #     size = 3
+    # ), dpi = 300) + 
+    RotatedAxis()
+
+pdf(paste0(fig_dir, 'test_pb_filtered_DMEs_Liver_Timepoint_', assay_use,'_box.pdf'), width=12, height=6)
+print(p) 
+dev.off()
+
+
+```
+
+Network analysis to group context-specific co-expression modules into lineage-wide "meta-modules"
+
+Notes:
+* Don't include TCAT modules inside of the meta-module analysis.
+  Rather, we should make network plots of the correlations / overlaps 
+  as the color / size of each node in the network.
+
+```{r eval=FALSE}
+
+assay_use <- 'decoupleR_ULM'
+
+
+
+modules <- read.csv(file=paste0(data_dir, 'Tcell_modules_combined.csv')) %>% 
+    subset(network != 'TCAT')
+mods <- as.character(unique(modules$module))
+mods <- mods[!grepl("Poor|Doublet", mods)]
+modules <- subset(modules, module %in% mods) 
+
+
+overlap_df <- read.csv(file=paste0(data_dir, 'module_pairwise_overlap.csv'))
+overlap_df <- subset(overlap_df, modules1 %in% mods)
+
+
+
+# pairwise pearson correlation of pseudobulk MEs
+MEs <- assays(experiments(mae)$modules)[[assay_use]][mods,]
+cor_MEs <- cor(t(MEs), method='pearson')
+
+
+cor_MEs[lower.tri(cor_MEs)] <- NA 
+tmp <- as.data.frame(cor_MEs)
+tmp$module <- rownames(tmp)
+
+
+graph_df <- tmp %>% 
+    tidyr::pivot_longer(
+        cols = all_of(mods)
+    ) %>% 
+    dplyr::rename(
+        module1 = module,
+        module2 = name,
+        cor = value
+    ) %>%
+    subset((!is.na(cor)) & (module1 != module2)) 
+
+graph_df$pair <- paste0(as.character(graph_df$module1), '_', as.character(graph_df$module2))
+
+
+# add the overlap stats;
+tmp <- dplyr::left_join(
+    graph_df,
+    overlap_df, 
+    by = 'pair'
+)
+graph_df$Jaccard <- tmp$Jaccard 
+graph_df$odds_ratio <- tmp$odds_ratio 
+graph_df$overlap_pval <- tmp$pval
+graph_df$overlap_fdr <- tmp$fdr
+
+
+# scale Jaccard index and Cor from 0 to 1
+graph_df$cor_scaled <- scales::rescale(graph_df$cor, to = c(0, 1))
+graph_df$Jaccard_scaled <- scales::rescale(graph_df$Jaccard, to = c(0, 1))
+
+graph_df_full <- graph_df
+
+
+library(igraph)
+library(tidygraph)
+library(ggraph)
+
+
+alpha <- 0.5
+cluster_resolution <- 2.5
+edge_prop <- 0.1
+
+
+
+
+# calculate a composite weight based on correlation of the MEs + overlap
+graph_df$weight <- (alpha * graph_df$cor_scaled) + ((1 - alpha) * graph_df$Jaccard_scaled)
+
+graph_df <- graph_df %>% 
+    slice_max(n = round(edge_prop * nrow(graph_df)), order_by = weight)
+
+# create the igraph
+graph <- graph_df %>%
+    igraph::graph_from_data_frame(directed=FALSE)
+
+# clustering:
+louvain_clusters <- igraph::cluster_louvain(graph, weights=NULL, resolution = cluster_resolution)
+leiden_clusters <- igraph::cluster_leiden(graph, weights=NULL, resolution = cluster_resolution, objective_function = 'modularity')
+V(graph)$louvain <- paste0('LV-', louvain_clusters$membership)
+V(graph)$leiden <- paste0('LD-', leiden_clusters$membership)
+
+n_louvain <- length(unique(V(graph)$louvain))
+n_leiden <- length(unique(V(graph)$leiden))
+
+# map leiden clusters back to the modules table: 
+ix <- match(modules$module, V(graph)$name)
+modules$leiden <- V(graph)$leiden[ix]
+table(modules$module)
+
+
+# convert to tidygraph
+graph <- graph %>% 
+    tidygraph::as_tbl_graph(directed=FALSE) %>%
+    tidygraph::activate(nodes)
+
+
+# select nodes to label
+mods_label <- subset(modules, network == 'TCAT') %>% .$module %>% unique()
+V(graph)$lab <- ifelse(V(graph)$name %in% mods_label, V(graph)$name, NA)
+
+
+# create the graph layout
+# lay <- layout_with_fr(graph)
+lay <- ggraph::create_layout(graph, layout='igraph', algorithm = 'nicely')
+
+p1 <- ggraph(graph, layout=lay, weight=weight) + 
+  ggrastr::rasterise(geom_edge_link(aes(color=weight, alpha=weight)), dpi=300) + 
+  geom_node_point(aes(fill=leiden), size=3, shape=21, color='white') +
+  scale_edge_colour_gradient2(high='grey', low='whitesmoke') + NoLegend()
+
+pdf(paste0(fig_dir, 'test_metamodule_graph_leiden3.pdf'), width=5, height=4)
+print(p1)
+dev.off()
+
+
+p1 <- ggraph(graph, layout=lay, weight=weight) + 
+  ggrastr::rasterise(geom_edge_link(aes(color=weight, alpha=weight)), dpi=300) + 
+  geom_node_point(aes(fill=leiden), size=3, shape=21, color='white') +
+geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) +
+  scale_edge_colour_gradient2(high='grey', low='whitesmoke') + NoLegend()
+
+pdf(paste0(fig_dir, 'test_metamodule_graph_leiden_label.pdf'), width=8, height=8)
+print(p1)
+dev.off()
+
+
+
+#----------------------------------------------------------#
+# Assign genes to meta-modules
+#
+# Calculate Meta-module eigengenes
+#----------------------------------------------------------#
+
+metamodule_df <- data.frame()
+for(metamodule in unique(modules$leiden)){
+    print(metamodule)
+    cur_df <- modules %>%
+        subset(leiden == metamodule) %>% 
+        group_by(gene_name) %>%
+        slice_max(n=1, order=weight) 
+
+    metamodule_df <- rbind(metamodule_df, cur_df)
+}
+
+
+#----------------------------------------------------------#
+# Save the meta-module attributes
+#----------------------------------------------------------#
+
+mm_list <- list(
+    modules = modules,
+    metamodules = metamodule_df,
+    graph = graph,
+    lay = lay,
+    graph_df = graph_df,
+    graph_df_full = graph_df_full
+)
+
+#---------------------------------------------------------#
+# Calculate decoupleR ULM scores for these modules
+#---------------------------------------------------------#
+
+MEs <- as.data.frame(t(assays(experiments(mae)$modules)$MEs))
+
+metamodule_hubs <- metamodule_df %>% 
+    dplyr::group_by(leiden) %>% 
+    dplyr::slice_max(n = 150, order = weight) %>% 
+    dplyr::select(-module) %>%
+    dplyr::rename(module = leiden)
+
+metamodule_hubs$module <- gsub('-', '', metamodule_hubs$module)
+
+# calculate MEs for each of these modules
+se_metamodules <- PseudobulkModuleEigengenes(
+    se = experiments(mae)$RNA, 
+    modules = metamodule_hubs,
+    assay_name = "VST",
+    new_assay_name = "MEs"
+)
+
+#---------------------------------------------------------#
+# Calculate pseudo-bulk decoupleR ULM scores
+#---------------------------------------------------------#
+
+library(decoupleR)
+
+signature_df <- decoupleR::run_ulm(
+    mat = assays(experiments(mae)$RNA)$VST,
+    net = metamodule_hubs,
+    .source = 'module',
+    .target = 'gene_name',
+    .mor = 'weight'
+)
+
+# cast from long to wide:
+signature_mat <- signature_df %>% 
+    dplyr::select(source, condition, score) %>%
+    tidyr::pivot_wider(
+        names_from = condition,
+        values_from = score,
+        values_fill = 0
+    ) %>%
+    as.data.frame()
+rownames(signature_mat) <- signature_mat$source
+signature_mat <- as.matrix(signature_mat[,-1])
+
+# re-order to match the se_modules object
+signature_mat <- signature_mat[rownames(se_metamodules), colnames(se_metamodules)]
+
+# add to the se_modules object
+assays(se_metamodules)$decoupleR_ULM <- signature_mat
+
+
+# tmp <- c(mae, NewAssayName = newAssay, mapFrom = "ExistingAssayName")
+# rownames(se_metamodules) <- gsub('-', '', rownames(se_metamodules))
+
+mae_old <- mae 
+
+mae <- MultiAssayExperiment(
+    experiments = list(
+        RNA = experiments(mae_old)$RNA,
+        modules = experiments(mae_old)$modules,
+        metamodules = se_metamodules
+    ),
+    colData = colData(experiments(mae_old)$RNA)
+)
+
+saveRDS(mae, paste0(data_dir, "Tcells_pseudobulk_MAE_metamodules.rds"))
+save(mm_list, file = paste0(data_dir, "Tcells_pseudobulk_metamodules_graph.rda"))
+
+
+```
+
+Visualize the correlations between modules and TCAT factors on the graph layout 
+
+```{r eval=FALSE}
+
+# load the TCAT results:
+tcat_weights <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/TCAT_reference_weights.csv")
+rownames(tcat_weights) <- gsub('[-/]', '.', tcat_weights$X)
+tcat_weights <- tcat_weights[,-1]
+
+
+# re-load the modules
+modules <- read.csv(file=paste0(data_dir, 'Tcell_modules_combined.csv'))
+
+# get the Pseudobulk MEs table w/ both hdWGCNA modules and TCAT factors: 
+assay_use <- 'decoupleR_ULM'
+MEs <- assays(experiments(mae)$modules)[[assay_use]]
+
+# split by modules and factors
+tcat_factors <- subset(modules, network == 'TCAT') %>% .$module %>% as.character() %>% unique()
+tcat_factors <- tcat_factors[!grepl("Poor|Doublet", tcat_factors)]
+mods <- subset(modules, network != 'TCAT') %>% .$module %>% as.character() %>% unique()
+
+cor_MEs <- cor(t(MEs), method='pearson')
+cor_MEs <- cor_MEs[mods,tcat_factors]
+
+
+
+plot_list <- list() 
+for(cur_factor in tcat_factors){
+
+    print(cur_factor)
+
+    # get the expression correlation between each module and this TCAT factor:
+    lay$factor_cor <- cor_MEs[lay$name, cur_factor]
+
+    p <- ggraph(layout=lay, weight=weight) + 
+    ggrastr::rasterise(
+        geom_edge_link(
+            aes(color=weight)
+        ), dpi=300) + 
+        geom_node_point(
+            aes(fill=factor_cor), size=3, shape=21, color='white'
+        ) +
+       # geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) +
+        scale_fill_gradient2(
+            mid='whitesmoke', 
+            low='navy', 
+            high='darkorange3',
+            limits = c(-0.9, 0.9),
+            oob = scales::squish
+        ) + 
+    scale_edge_colour_gradient(high='grey', low='whitesmoke', limits=c(0.3, 0.75), oob=scales::squish)  +
+            ggtitle(cur_factor) + theme(
+                plot.title = element_text(hjust=0.5)
+            ) + 
+          theme(
+            panel.border = element_rect(fill=NA, color='black', linewidth=0.75)
+        ) 
+
+    plot_list[[cur_factor]] <- p
+
+}
+
+
+
+patch <- wrap_plots(plot_list, ncol=6) + plot_layout(guides='collect')
+
+pdf(paste0(fig_dir, 'metamodule_graph_TCAT_factor.pdf'), width=18, height=24)
+print(patch)
+dev.off()
+
+#----------------------------------------------------------#
+# Visualize module-module similarity networks
+#----------------------------------------------------------#
+
+modules <- mm_list$modules
+graph <- mm_list$graph
+graph_df <- mm_list$graph_df
+lay <- mm_list$lay 
+
+# number of genes per module:
+n_genes <-table(modules$module)
+lay$n_genes <- as.numeric(n_genes[lay$name])
+
+# add the tissue and timepoint to the layout
+lay$Tissue <- do.call(rbind, strsplit(lay$name, '_'))[,1]
+lay$Timepoint <-  do.call(rbind, strsplit(lay$name, '_'))[,2]
+
+tissue_colors <- paste0(MetBrewer::met.brewer("Egypt", n=3))
+names(tissue_colors) <- c('Liver', 'Lung', 'Primary')
+tissue_colors
+
+shapes <- c(21, 23); names(shapes) <- c('T1', 'T2')
+
+p <- ggraph(layout=lay, weight=weight) + 
+  ggrastr::rasterise(
+    geom_edge_link(
+        aes(color=weight)
+    ), dpi=300) + 
+  geom_node_point(
+    aes(fill=Tissue, shape=Timepoint, size=log10(n_genes)), 
+    color='white' ) +  
+  scale_shape_manual(values = shapes) +
+  scale_fill_manual(values = tissue_colors) +
+  scale_edge_colour_gradient(high='grey', low='whitesmoke', limits=c(0.3, 0.75), oob=scales::squish) 
+
+pdf(paste0(fig_dir, 'metamodule_graph_tissue.pdf'), width=5, height=5)
+print(p + NoLegend())
+dev.off()
+
+
+
+p2 <- p + geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) 
+
+pdf(paste0(fig_dir, 'metamodule_graph_tissue_labeled_big.pdf'), width=10, height=10)
+print(p2)
+dev.off()
+
+
+```
+
+Analysis of TCAT antigen-specific activation score 
+
+```{r eval=FALSE}
+
+source('/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/scripts/plotting/plotting_functions.R')
+
+
+# load the TCAT weights:
+tcat_weights <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/TCAT_reference_weights.csv")
+rownames(tcat_weights) <- gsub('[-/]', '.', tcat_weights$X)
+tcat_weights <- tcat_weights[,-1]
+
+tcat_scores <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcells_TCAT_scores.csv")
+
+tcat_asa_scores <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcells_TCAT_summaries.csv")
+rownames(tcat_asa_scores) <- tcat_asa_scores$barcode
+
+# add ASA score to the seurat object:
+seurat_obj$ASA <- tcat_asa_scores$ASA 
+seurat_obj$ASA_binary <- tcat_asa_scores$ASA_binary
+
+
+p1 <- FeatureEmbedding(
+  seurat_obj,
+  features = 'ASA',
+  reduction = 'X_umap',
+  raster=TRUE, dpi=300,
+  ncol = 4,
+  plot_max = 'q99',
+  plot_min = 0.05,
+  colfunc = viridis::magma,
+  rev_colors = TRUE
+) + ggtitle("ASA Score")
+
+pdf(paste0(fig_dir, 'featureplot_ASA.pdf'), width=7, height=6, useDingbats=FALSE)
+p1
+dev.off()
+
+#----------------------------------------------------------#
+# Correlate modules w/ ASA score:
+#----------------------------------------------------------#
+
+cor_df <- Reduce(rbind, lapply(names(seurat_list), function(cur_network){
+
+    print(cur_network)
+    MEs <- GetMEs(seurat_list[[cur_network]])
+
+    # subset ASA
+    cur_asa <- tcat_asa_scores[rownames(MEs),]
+
+    tmp <- cor(MEs, cur_asa$ASA, method = 'pearson')
+    cur_cor_df <- data.frame(
+        module = rownames(tmp),
+        cor = as.numeric(tmp),
+        network = cur_network
+    )
+    cur_cor_df
+
+})) %>% subset(module != 'grey')
+
+
+rownames(cor_df) <- cor_df$module
+
+lay <- mm_list$lay
+
+    # get the expression correlation between each module and this TCAT factor:
+    lay$ASA_cor<- cor_df[lay$name, 'cor']
+
+    p <- ggraph(layout=lay, weight=weight) + 
+    ggrastr::rasterise(
+        geom_edge_link(
+            aes(color=weight)
+        ), dpi=300) + 
+        geom_node_point(
+            aes(fill=ASA_cor), size=3, shape=21, color='white'
+        ) +
+       # geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) +
+        scale_fill_gradient2(
+            mid='whitesmoke', 
+            low='navy', 
+            high='darkorange3',
+            limits = c(-0.6, 0.6),
+            oob = scales::squish
+        ) + 
+    scale_edge_colour_gradient(high='grey', low='whitesmoke', limits=c(0.3, 0.75), oob=scales::squish)  +
+            ggtitle("ASA") + theme(
+                plot.title = element_text(hjust=0.5)
+            ) + 
+          theme(
+            panel.border = element_rect(fill=NA, color='black', linewidth=0.75)
+        ) 
+
+
+pdf(paste0(fig_dir, 'metamodule_graph_ASA.pdf'), width=4.5, height=4)
+print(p)
+dev.off()
+
+#----------------------------------------------------------#
+# Compare ASA score across groups (?)
+#----------------------------------------------------------#
+
+# Calculate average ASA score per group
+seurat_obj$Patient_Timepoint <- paste0(seurat_obj$Patient, ':T', seurat_obj$Timepoint)
+seurat_obj$pb_id <- paste0(as.character(seurat_obj$Patient_Timepoint), '.', as.character(seurat_obj$annotation))
+
+# 2. Calculate average ASA score per pseudobulk replicate
+asa_summary <- seurat_obj@meta.data %>%
+  group_by(pb_id) %>%
+  summarise(avg_ASA = mean(ASA, na.rm = TRUE)) %>%
+  filter(pb_id != "") %>%
+  subset(pb_id %in% rownames(colData(mae))) %>%
+  as.data.frame() %>%
+  column_to_rownames("pb_id")     
+
+colData(mae)$ASA <- asa_summary[rownames(colData(mae)), "avg_ASA"]
+
+df <- as.data.frame(colData(mae))
+df <- df[!is.na(df$Response_ratio),]
+df$Response_ratio <- as.numeric(df$Response_ratio)
+cor(df$Response_ratio, df$ASA)
+
+
+
+
+
+p <- df %>%
+    subset(Timepoint == 2) %>%
+    ggplot(aes(x = Response_ratio, y = ASA)) +
+    geom_point() +
+    geom_smooth(method='lm') + 
+    ggpubr::stat_cor() + 
+    facet_wrap(~annotation, scales='free') 
+
+pdf(paste0(fig_dir, 'ASA_vs_response.pdf'), width=16, height=16)
+print(p)
+dev.off()
+
+# correlation between MEs and ASA score!
+assay_use <- 'decoupleR_ULM'
+MEs <- assays(experiments(mae)$modules)[[assay_use]]
+
+asa_cor <- cor(colData(mae)$ASA, t(MEs))
+
+# get the graph layout
+lay <- mm_list$lay
+
+    # get the expression correlation between each module and this TCAT factor:
+    lay$ASA_cor<- asa_cor[lay$name]
+
+    p <- ggraph(layout=lay, weight=weight) + 
+    ggrastr::rasterise(
+        geom_edge_link(
+            aes(color=weight)
+        ), dpi=300) + 
+        geom_node_point(
+            aes(fill=ASA_cor), size=3, shape=21, color='white'
+        ) +
+       # geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) +
+        scale_fill_gradient2(
+            mid='whitesmoke', 
+            low='navy', 
+            high='darkorange3',
+            limits = c(-0.6, 0.6),
+            oob = scales::squish
+        ) + 
+    scale_edge_colour_gradient(high='grey', low='whitesmoke', limits=c(0.3, 0.75), oob=scales::squish)  +
+            ggtitle("ASA") + theme(
+                plot.title = element_text(hjust=0.5)
+            ) + 
+          theme(
+            panel.border = element_rect(fill=NA, color='black', linewidth=0.75)
+        ) 
+
+
+pdf(paste0(fig_dir, 'metamodule_graph_ASA_pb.pdf'), width=4.5, height=4)
+print(p)
+dev.off()
+
+
+
+
+
+
+#----------------------------------------------------------#
+# ASA vs. clonal proportion
+#----------------------------------------------------------#
+
+library(ggarrow)
+
+tcell_colors <- read.csv("~/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcell_annotation_colors.csv")
+cp <- tcell_colors$hex_color; names(cp) <- tcell_colors$group
+
+
+# load the T-cell clonal proportions:
+clone_df <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/SP_Cells_Clonal_Proportions_01-2026.csv") 
+
+clone_meta <- seurat_obj@meta.data
+clone_meta$barcode <- paste0(clone_meta$Replicate, '_', clone_meta$bc)
+table(clone_meta$barcode %in% clone_df$barcode)
+clone_meta <- subset(clone_meta, barcode %in% clone_df$barcode)
+rownames(clone_meta) <- clone_meta$barcode 
+
+clone_meta$Clonal_Proportion <- clone_df$Clonal_Proportion
+clone_meta$Clonal_Proportion_log10 <- clone_df$Clonal_Proportion_log10
+
+
+# Calculate average ASA and Clonal Proportion per group
+plot_df <- clone_meta %>%
+  group_by(annotation, Tissue, Timepoint) %>%
+  summarise(
+    mean_ASA = mean(ASA, na.rm = TRUE),
+    mean_Clonal_Prop = mean(Clonal_Proportion_log10, na.rm = TRUE),
+    cell_count = n(), # Useful for sizing points in your plot
+    .groups = "drop"
+  ) %>%
+  subset(!(annotation %in% c("NK", "NK-Tgd", "Tgd-17", "Tgd-V1")))
+
+# 1. Identify the top 5 most clonal groups per tissue for labeling
+label_df <- plot_df %>%
+  filter(Tissue %in% c("Liver", "Lung") & Timepoint %in% c(2)) %>%
+  group_by(Tissue) %>%
+  # Rank by clonality (right side of the plot)
+  slice_max(order_by = mean_Clonal_Prop, n = 5) %>%
+  ungroup()
+
+path_df <- plot_df %>%
+  filter(Tissue %in% c("Liver", "Lung") & Timepoint %in% c(1, 2)) %>%
+  group_by(annotation, Tissue) %>%
+  filter(n() > 1) %>% # Only keep groups present in both timepoints
+  arrange(Timepoint)
+
+
+# 2. Build the plot
+p <- plot_df %>% 
+    filter(Tissue %in% c("Liver", "Lung") & Timepoint %in% c(1, 2)) %>%
+    ggplot(aes(x = mean_Clonal_Prop, y = mean_ASA)) + 
+    # # A. Add the Trajectory Lines FIRST (so they stay behind the points)
+    # geom_path(data = path_df, 
+    #           aes(group = annotation), 
+    #           color = "grey80", 
+    #           arrow = arrow(length = unit(0.1, "cm")), 
+    #           alpha = 0.6) +
+    # A. IMPROVED ARROWS: Using geom_arrow for "gap" support
+    geom_arrow(data = path_df, 
+               aes(group = annotation), 
+               color = "grey",
+               linewidth = 0.5,
+               arrow_head = arrow_head_wings(20), # Sleek arrowhead
+               # This "re-centers" the arrow so it doesn't hide under the points
+               resect_head = 2,   # Gaps the arrow 4pts before the T2 coordinate
+               alpha = 0.6) +
+    
+    # B. Main points (White border by default)
+    geom_point(aes(fill = annotation, 
+                   shape = as.factor(Timepoint), 
+                   size = cell_count), 
+               color = 'white', stroke = 0.5) + 
+    
+    # C. ADD BLACK OUTLINE for labeled points only
+    geom_point(data = label_df, 
+               aes(fill = annotation, 
+                   shape = as.factor(Timepoint), 
+                   size = cell_count), 
+               color = "black", stroke = 0.8, show.legend = FALSE) +
+
+    # D. Labels
+    geom_text_repel(
+        data = label_df,
+        aes(label = annotation),
+        size = 3,
+        fontface = "bold",
+        box.padding = 0.6,
+        point.padding = 0.4,
+        max.overlaps = Inf,
+        segment.color = 'grey30',
+        force = 12,
+        show.legend = FALSE
+    ) +
+    guides(
+        fill = guide_legend(override.aes = list(shape = 21, color = "black", size = 4)),
+        shape = guide_legend(override.aes = list(color = "black", size = 4)),
+        size = guide_legend(override.aes = list(color = "black"))
+    ) +
+    # Stylistic setups
+    scale_shape_manual(values = c("1" = 21, "2" = 23)) + 
+    scale_fill_manual(values = cp) +
+    scale_size_continuous(range = c(1, 6)) + # Adjust point size range
+    facet_wrap(~Tissue) +
+    labs(
+        x = "Mean Clonal Proportion (log10)",
+        y = "Mean Antigen-Specific Activation (ASA)",
+        shape = "Timepoint (1=Pre, 2=Post)",
+        fill = "Cell Population",
+        size = "Cell Count"
+    ) +
+    theme(
+        strip.background = element_rect(fill = "white"),
+        strip.text = element_text(face = "bold"),
+        legend.text = element_text(size = 8),
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth=1,color='black', fill=NA),
+       # panel.grid.major.y = element_line(linewidth=0.25, color='lightgrey'),
+        #panel.grid.major.x = element_line(linewidth=0.25, color='lightgrey'),
+    )
+
+pdf(paste0(fig_dir, 'ASA_vs_clonality_trajectory.pdf'), width=11, height=5)
+print(p) 
+dev.off()
+
+
+pdf(paste0(fig_dir, 'ASA_vs_clonality_trajectory_small.pdf'), width=9, height=4)
+print(p) 
+dev.off()
+
+# # 2. Build the updated plot
+# p <- plot_df %>% 
+#     filter(Tissue %in% c("Liver", "Lung") & Timepoint %in% c(1,2)) %>%
+#     ggplot(aes(x = mean_Clonal_Prop, y = mean_ASA)) + 
+#     geom_point(aes(fill = annotation, shape = as.factor(Timepoint), size=cell_count), color='white') + 
+#     # Add the labels using ggrepel
+#     geom_text_repel(
+#         data = label_df,
+#         aes(label = annotation),
+#         size = 3,
+#         box.padding = 0.5,
+#         point.padding = 0.3,
+#         max.overlaps = Inf,
+#         segment.color = 'grey50',
+#         force = 10, # Increases push between labels
+#         show.legend = FALSE
+#     ) +
+#     scale_shape_manual(values=c(21, 23)) + 
+#     scale_fill_manual(values=cp) +
+#     facet_wrap(~Tissue) +
+#     labs(
+#         x = "Mean Clonal Proportion (log10)",
+#         y = "Mean Antigen-Specific Activation (ASA)",
+#         shape = "Timepoint",
+#         fill = "Cell Population"
+#     ) +
+#     # Adjust theme for a publication-ready look
+#     theme(
+#         strip.background = element_rect(fill = "white"),
+#         legend.text = element_text(size = 8)
+#     )
+
+# pdf(paste0(fig_dir, 'ASA_vs_clonality_labeled.pdf'), width=14, height=5)
+# print(p) 
+# dev.off()
+
+
+#----------------------------------------------------------#
+# Module-trait correlation with Response Ratio...?
+#----------------------------------------------------------#
+
+
+# correlation between MEs and ASA score!
+assay_use <- 'decoupleR_ULM'
+MEs <- assays(experiments(mae)$modules)[[assay_use]]
+
+meta <- as.data.frame(colData(mae))
+meta <- meta[!is.na(meta$Response_ratio),]
+meta <- meta %>% subset(Timepoint == 1)
+meta$Response_ratio <- as.numeric(meta$Response_ratio)
+MEs <- MEs[,rownames(meta)]
+
+response_cor <- as.numeric(cor(meta$Response_ratio, t(MEs)))
+names(response_cor) <- rownames(MEs)
+quantile(response_cor)
+
+# get the graph layout
+lay <- mm_list$lay
+
+    # get the expression correlation between each module and this TCAT factor:
+    lay$cor<- response_cor[lay$name]
+
+    p <- ggraph(layout=lay, weight=weight) + 
+    ggrastr::rasterise(
+        geom_edge_link(
+            aes(color=weight)
+        ), dpi=300) + 
+        geom_node_point(
+            aes(fill=cor), size=3, shape=21, color='white'
+        ) +
+       # geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) +
+        scale_fill_gradient2(
+            mid='whitesmoke', 
+            low='navy', 
+            high='darkorange3',
+            limits = c(-0.6, 0.6),
+            oob = scales::squish
+        ) + 
+    scale_edge_colour_gradient(high='grey', low='whitesmoke', limits=c(0.3, 0.75), oob=scales::squish)  +
+            ggtitle("Response ratio") + theme(
+                plot.title = element_text(hjust=0.5)
+            ) + 
+          theme(
+            panel.border = element_rect(fill=NA, color='black', linewidth=0.75)
+        ) 
+
+
+pdf(paste0(fig_dir, 'metamodule_graph_response_ratio_T1.pdf'), width=4.5, height=4)
+print(p)
+dev.off()
+
+```
+
+Module-trait correlation with response ratio 
+
+
+```{r eval=FALSE}
+
+
+source('/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/scripts/plotting/plotting_functions.R')
+
+
+# load the TCAT weights:
+tcat_weights <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/TCAT_reference_weights.csv")
+rownames(tcat_weights) <- gsub('[-/]', '.', tcat_weights$X)
+tcat_weights <- tcat_weights[,-1]
+
+tcat_scores <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcells_TCAT_scores.csv")
+
+tcat_asa_scores <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcells_TCAT_summaries.csv")
+rownames(tcat_asa_scores) <- tcat_asa_scores$barcode
+
+# add ASA score to the seurat object:
+seurat_obj$ASA <- tcat_asa_scores$ASA 
+seurat_obj$ASA_binary <- tcat_asa_scores$ASA_binary
+
+
+p1 <- FeatureEmbedding(
+  seurat_obj,
+  features = 'ASA',
+  reduction = 'X_umap',
+  raster=TRUE, dpi=300,
+  ncol = 4,
+  plot_max = 'q99',
+  plot_min = 0.05,
+  colfunc = viridis::magma,
+  rev_colors = TRUE
+) + ggtitle("ASA Score")
+
+pdf(paste0(fig_dir, 'featureplot_ASA.pdf'), width=7, height=6, useDingbats=FALSE)
+p1
+dev.off()
+
+#----------------------------------------------------------#
+# Correlate modules w/ ASA score:
+#----------------------------------------------------------#
+
+cor_df <- Reduce(rbind, lapply(names(seurat_list), function(cur_network){
+
+    print(cur_network)
+    MEs <- GetMEs(seurat_list[[cur_network]])
+
+    # subset ASA
+    cur_asa <- tcat_asa_scores[rownames(MEs),]
+
+    tmp <- cor(MEs, cur_asa$ASA, method = 'pearson')
+    cur_cor_df <- data.frame(
+        module = rownames(tmp),
+        cor = as.numeric(tmp),
+        network = cur_network
+    )
+    cur_cor_df
+
+})) %>% subset(module != 'grey')
+
+
+rownames(cor_df) <- cor_df$module
+
+lay <- mm_list$lay
+
+    # get the expression correlation between each module and this TCAT factor:
+    lay$ASA_cor<- cor_df[lay$name, 'cor']
+
+    p <- ggraph(layout=lay, weight=weight) + 
+    ggrastr::rasterise(
+        geom_edge_link(
+            aes(color=weight)
+        ), dpi=300) + 
+        geom_node_point(
+            aes(fill=ASA_cor), size=3, shape=21, color='white'
+        ) +
+       # geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) +
+        scale_fill_gradient2(
+            mid='whitesmoke', 
+            low='navy', 
+            high='darkorange3',
+            limits = c(-0.6, 0.6),
+            oob = scales::squish
+        ) + 
+    scale_edge_colour_gradient(high='grey', low='whitesmoke', limits=c(0.3, 0.75), oob=scales::squish)  +
+            ggtitle("ASA") + theme(
+                plot.title = element_text(hjust=0.5)
+            ) + 
+          theme(
+            panel.border = element_rect(fill=NA, color='black', linewidth=0.75)
+        ) 
+
+
+pdf(paste0(fig_dir, 'metamodule_graph_ASA.pdf'), width=4.5, height=4)
+print(p)
+dev.off()
+
+```
+
+
+FindAllMarkers for modules x annoations 
+
+```{r eval=FALSE}
+library(dplyr)
+library(tidyr)
+
+assay_use <- 'decoupleR_ULM'
+
+# get the graph layout 
+lay <- mm_list$lay
+
+# calculate the average ME per group
+MEs <- as.data.frame(t(assays(experiments(mae)$modules)[[assay_use]]))
+meta <- as.data.frame(colData(mae))
+
+# 2. Align and Aggregate
+# We convert the matrix to a dataframe to use dplyr's grouping power
+cluster_me_summary <- MEs %>%
+  as.data.frame() %>%
+  mutate(annotation = meta$annotation) %>% # Add the cluster identities
+  group_by(annotation) %>%
+  summarise(across(everything(), mean, na.rm = TRUE)) %>%
+  column_to_rownames("annotation")          # Move cluster names back to rows
+
+# 3. Transpose if you prefer Modules as Rows and Clusters as Columns
+cluster_me_matrix <- t(cluster_me_summary)
+
+
+
+dme_df <- data.frame()
+module_avg_exp <- data.frame()
+for(cur_net in names(seurat_list)){
+    print(cur_net)
+    cur_df <- hdWGCNA::FindAllDMEs(
+        seurat_list[[cur_net]],
+        group.by = 'annotation'
+    )
+    cur_df$network <- cur_net
+    dme_df <- rbind(dme_df, cur_df)
+
+    MEs <- as.data.frame(GetMEs(seurat_list[[cur_net]]))
+    meta <- seurat_list[[cur_net]]@meta.data 
+
+    # cluster_me_summary <- MEs %>%
+    #     as.data.frame() %>%
+    #     mutate(annotation = meta$annotation) %>% # Add the cluster identities
+    #     group_by(annotation) %>%
+    #     summarise(across(everything(), mean, na.rm = TRUE)) %>%
+    #     column_to_rownames("annotation")          # Move cluster names back to rows
+
+    cluster_me_summary <- MEs %>%
+        mutate(annotation = meta$annotation) %>% 
+        group_by(annotation) %>%
+        summarise(across(everything(), mean, na.rm = TRUE)) %>%
+        mutate(across(where(is.numeric), ~ {
+            if(max(.) == min(.)) 0 else (. - min(.)) / (max(.) - min(.))
+        })) %>%
+        column_to_rownames("annotation")
+
+    if(nrow(module_avg_exp) == 0){
+        module_avg_exp <- cluster_me_summary
+    } else{
+        cluster_me_summary <- cluster_me_summary[rownames(module_avg_exp),]
+        module_avg_exp <- cbind(module_avg_exp, cluster_me_summary)
+    }
+}
+
+marker_df <- dme_df
+marker_df$module <- gsub("-", '_', marker_df$module)
+
+
+
+table(dme_df$module)
+
+
+
+
+
+
+cur_cluster <- 'NK'
+
+plot_list <- list()
+for(cur_cluster in unique(dme_df$group)){
+
+    print(cur_cluster)
+
+    cur_df <- subset(dme_df, group == cur_cluster)
+    rownames(cur_df) <- gsub('-', '_', cur_df$module)
+
+    # get the expression correlation between each module and this TCAT factor:
+    lay$log2fc <- cur_df[lay$name, 'avg_log2FC']
+    lay$p_val_adj <- cur_df[lay$name, 'p_val_adj']
+
+    # fix min p-val 
+    min_p <- lay$p_val_adj; min_p <- min(min_p[min_p != 0])
+    lay$p_val_adj <- ifelse(lay$p_val_adj == 0, min_p, lay$p_val_adj)
+
+    # get teh average expression
+    lay$avg_exp <- as.numeric(module_avg_exp[cur_cluster, lay$name])
+    max_size <- 1
+    #max_size <- quantile(lay$avg_exp, 0.95)
+
+    p <- ggraph(layout=lay, weight=weight) + 
+    ggrastr::rasterise(
+        geom_edge_link(
+            aes(color=weight)
+        ), dpi=300) + 
+        geom_node_point(
+            aes(fill=log2fc, size=avg_exp), shape=21, color='white'
+        ) +
+        # geom_node_text(aes(label=name), repel=TRUE, max.overlaps=Inf, size=2) +
+        scale_fill_gradient2(
+            mid='pink', 
+            low='whitesmoke', 
+            high='darkorchid1',
+            limits = c(-5, 5),
+            oob = scales::squish
+        ) + 
+    scale_edge_colour_gradient(high='grey', low='whitesmoke', limits=c(0.3, 0.75), oob=scales::squish)  +
+    scale_size_continuous(range=c(1,5), limits=c(0, max_size)) + 
+        ggtitle(cur_cluster) + theme(
+                plot.title = element_text(hjust=0.5)
+            ) + 
+            theme(
+            panel.border = element_rect(fill=NA, color='black', linewidth=0.75)
+        ) 
+
+
+    plot_list[[cur_cluster]] <- p
+
+}
+
+patch <- wrap_plots(plot_list, ncol=6) + plot_layout(guides='collect')
+
+pdf(paste0(fig_dir, 'metamodule_graph_FindMarkers3.pdf'), width=18, height=12)
+print(patch)
+dev.off()
+
+
+
+subset(dme_df, module == "Liver-T1-1") %>% arrange(-avg_log2FC) %>% head
+
+```
+
+
+
+
+
+Plot PB distributions for selected modules 
+
+```{r eval=FALSE}
+
+
+#---------------------------------------------------------#
+# Box and whisker plot of one of the top hits 
+#---------------------------------------------------------#
+
+MEs <- assays(experiments(mae)$modules)[[assay_use]]
+
+cur_mod <- 'Liver_T1_1'
+
+plot_df <- as.data.frame(colData(mae))
+MEs <- assays(experiments(mae)$modules)[[assay_use]]
+
+plot_df$value <- as.numeric(MEs[cur_mod, rownames(plot_df)])
+
+
+p <- plot_df %>%
+    subset(Tissue == 'Liver') %>%
+    ggplot(aes(x = Timepoint , y = value)) + 
+    geom_boxplot(
+        aes(fill = as.factor(Timepoint)),
+        outlier.shape = NA,
+      #  alpha = 0.25,
+        width = 0.5,
+        position = position_dodge(width = 0.8) # Explicitly set dodge width
+    ) +
+    ggrastr::rasterise(
+        ggbeeswarm::geom_quasirandom(
+            aes(group = as.factor(Timepoint)),
+            dodge.width = 0.8,   # This MUST match the boxplot dodge width
+            size = 1,
+            alpha = 1
+        ), dpi = 300) +
+    ggpubr::stat_compare_means(method = 'wilcox') + 
+    RotatedAxis()
+
+pdf(paste0(fig_dir, 'boxplot_', cur_mod, '.pdf'), width=4.5, height=4)
+print(p) 
+dev.off()
+
+pdf(paste0(fig_dir, 'boxplot_', cur_mod, '.pdf'), width=12, height=12)
+p + facet_wrap(~ annotation)
+dev.off()
+
+
+```
+
+
+
+
+
+
+Metamodule differential expression 
+
+```{r eval=FALSE}
+
+# subset by Tissue 
+assay_use <- 'decoupleR_ULM'
+# assay_use <- 'MEs'
+
+# update the timepoint column so limma doesn't freak out
+colData(mae)$TP <-paste0("T", as.character(colData(mae)$Timepoint))
+
+# define the current MAE object by subsetting the Tissue:
+cur_tissue <- 'Liver'
+cur_tissue <- 'Lung'
+
+cur_mae <- mae[, colData(mae)$Tissue == cur_tissue]
+
+# Make a test comparison between 
+meta <- colData(cur_mae)
+
+# define the current cluster
+clusters <- unique(colData(cur_mae)$annotation)
+
+cur_cluster <- 'NK'
+dme_df <- data.frame()
+for(cur_cluster in clusters){
+
+    print(cur_cluster)
+
+    pb_keep <- meta %>% subset(
+        (annotation == cur_cluster) 
+    )
+
+    # subset the MAE object
+    cur <- cur_mae[,rownames(pb_keep)]
+
+    # get the module eigengene matrix:
+    MEs <- assays(experiments(cur)$metamodules)[[assay_use]]
+
+    # set up the design matrix:
+    condition_factor <- factor(pb_keep$TP, levels = c("T1", "T2"))
+    patient_factor <- factor(pb_keep$Patient)
+    n_cells_scaled  <- as.numeric(scale(log10(pb_keep$nCells))) # Scale to keep coefficients comparable
+    condition_vec <- ifelse(condition_factor == 'T1', 0, 1)
+
+    # # see if we need to skip:
+    if(any(table(condition_factor) < 3)){
+        print(paste0("Skipping ", cur_cluster, ' ...'))
+        next
+    }
+
+    # design <- model.matrix(~ 0 + condition_factor)
+    design <- model.matrix(~ patient_factor + condition_factor + n_cells_scaled)
+
+    # Rename the columns for cleaner output
+    colnames(design) <- gsub("condition_factor", "", colnames(design))
+
+    # Display the design matrix (optional, but helpful for verification)
+    head(design)
+
+    # CHECK: Is the design matrix estimable?
+    check_est <- limma::nonEstimable(design)
+
+    if(!is.null(check_est)){
+        cat(paste0("\nSkipping ", cur_cluster, " - Collinearity detected in: ", 
+                paste(check_est, collapse=", "), "\n"))
+        next 
+    }
+
+    # Fit the linear model to the transposed ME data
+    # Since MEs are continuous, scaled values, no voom transformation is needed.
+    fit <- lmFit(MEs, design)
+    fit <- tryCatch({
+        eBayes(fit, robust = TRUE, trend = TRUE)
+    }, error = function(e){
+        cat(paste0("\nSkipping ", cur_cluster, " - eBayes failed: ", e$message, "\n"))
+        return(NULL)
+    })
+    if (is.null(fit)){ next}
+
+    results <- topTable(fit, 
+                    coef = ncol(design), 
+                    number = Inf, 
+                    sort.by = "P",
+                    adjust.method = "BH")
+
+    # add comparison info 
+    results$module <- rownames(results)
+    results$cluster <- cur_cluster
+    rownames(results) <- 1:nrow(results)
+
+    dme_df <- rbind(dme_df, results)
+
+}
+
+# calculate the global adjusted p-value
+dme_df$global_adj_pval <- p.adjust(dme_df$P.Value, method = "BH")
+
+# how many significant hits are there?
+signif_df <- subset(dme_df, P.Value < 0.05) 
+
+subset(dme_df, P.Value < 0.05) %>% dim()
+subset(dme_df, adj.P.Val < 0.05) %>% dim()
+subset(dme_df, adj.P.Val < 0.1) %>% dim()
+subset(dme_df, global_adj_pval < 0.05) %>% dim()
+
+subset(dme_df, adj.P.Val < 0.05) %>% .$module %>% unique()
+
+
+# write the results:
+write.csv(dme_df, file = paste0(data_dir, 'Pseudobulk_DMEs_', cur_tissue, '_metamodules.csv'), quote=FALSE)
+
+# 1. Scale AveExpr per module across all clusters
+dme_plot_df <- dme_df %>%
+  group_by(module) %>%
+  mutate(
+    # Z-score to center the data
+    z_expr = as.numeric(scale(AveExpr)),
+    # Rescale 0-1 for the 'size' aesthetic
+    scaled_expr = (z_expr - min(z_expr)) / (max(z_expr) - min(z_expr))
+  ) %>%
+  ungroup()
+
+# set anything greater than the max_val to the max_val
+max_val <- 3 
+dme_plot_df$logFC <- ifelse(abs(dme_plot_df$logFC) > max_val, max_val * sign(dme_plot_df$logFC), dme_plot_df$logFC)
+
+p <- dme_plot_df %>%
+    ggplot() + 
+    geom_point(
+        aes(x = cluster, y = module, color = logFC, size = scaled_expr)
+    ) + 
+    geom_point(
+        data = subset(dme_plot_df, adj.P.Val < 0.1),
+        aes(x = cluster, y = module, size = scaled_expr), 
+        color = 'black', shape=21, fill = NA, stroke = 0.5
+    ) + 
+    scale_color_gradient2(low = 'dodgerblue', mid = 'whitesmoke', high = 'darkgoldenrod1') + 
+    coord_fixed() + RotatedAxis() + 
+    theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth=1,color='black', fill=NA),
+      #  panel.grid.major.y = element_line(linewidth=0.25, color='lightgrey'),
+        plot.title = element_text(hjust=0.5),
+        strip.background = element_blank(),
+        strip.text = element_text(face='bold')
+    ) + xlab('') + ylab('')
+
+
+pdf(paste0(fig_dir, 'Pseudobulk_DMEs_metamodules_', cur_tissue, '_Timepoint_', assay_use,'_dotplot.pdf'), width=8, height=8)
+print(p) 
+dev.off()
+
+
+
+# volcano plot code (not used)
+# p <- dme_df %>% 
+#     ggplot(aes(x = logFC, y = -log10(P.Value))) + 
+#     geom_point(aes(color = cluster)) +
+#     geom_hline(yintercept = -log10(0.05), linetype='dashed', linewidth=0.5, color='grey') 
+#     #xlim(c(-1,1))
+
+# patch <- p + facet_wrap(~cluster, ncol=6, scales='free') + NoLegend()
+
+# pdf(paste0(fig_dir, 'test_pb_filtered_DMEs_Liver_Timepoint_', assay_use,'_fdr.pdf'), width=8, height=8)
+# print(p) 
+# dev.off()
+
+#---------------------------------------------------------#
+# Box and whisker plot of one of the top hits 
+#---------------------------------------------------------#
+
+subset(dme_df, P.Value < 0.05)
+
+cur_mod <- "LD11" # Tgd-v1
+
+plot_df <- as.data.frame(colData(mae))
+MEs <- assays(experiments(mae)$metamodules)[[assay_use]]
+
+plot_df$value <- as.numeric(MEs[cur_mod, rownames(plot_df)])
+
+p <- plot_df %>%
+    subset(Tissue == 'Liver') %>%
+    ggplot(aes(x = annotation , y = value)) + 
+    geom_boxplot(
+        aes(fill = as.factor(Timepoint)),
+        outlier.shape = NA,
+      #  alpha = 0.25,
+        width = 0.5,
+        position = position_dodge(width = 0.8) # Explicitly set dodge width
+    ) +
+    ggrastr::rasterise(
+        ggbeeswarm::geom_quasirandom(
+            aes(group = as.factor(Timepoint)),
+            dodge.width = 0.8,   # This MUST match the boxplot dodge width
+            size = 1,
+            alpha = 1
+        ), dpi = 300) +
+    RotatedAxis()
+
+pdf(paste0(fig_dir, 'test_pb_filtered_DMEs_Liver_Timepoint_', assay_use,'_box_MM.pdf'), width=12, height=6)
+print(p) 
+dev.off()
+
+
+```
+
+
+
+
+
+
+Test signature plotting as a box plot
+
+Later, should update SignatureDistPlot function to work with this data
+
+```{r eval=FALSE}
+
+# get the MEs
+
+MEs <- as.data.frame(t(assays(experiments(mae)$modules)$MEs))
+mods <- colnames(MEs)
+meta <- as.data.frame(colData(mae))
+
+MEs$pseudobulk <- rownames(MEs)
+meta$pseudobulk <- rownames(meta)
+
+# cast from wide to long format:
+ME_df <- tidyr::pivot_longer(
+  MEs,
+  cols = all_of(mods)) %>%
+  dplyr::rename(module = name, module_score = value)
+
+plot_df <- dplyr::left_join(
+    ME_df, 
+    meta, 
+    by = 'pseudobulk'
+)
+
+plot_df <- plot_df[grepl("Liver", plot_df$module),]
+
+plot_df <- plot_df %>% subset(
+    (Tissue == 'Liver') & 
+    (Timepoint %in% c(1,2)) & 
+    (Primary_tumor == 'CRC') 
+)
+
+p <- plot_df %>%
+    ggplot(aes(y = module_score, x = Timepoint)) + 
+    ggrastr::rasterise(ggbeeswarm::geom_quasirandom(
+        aes(color=module),
+        method = 'pseudorandom',
+        size = 3
+    ), dpi = 300) +
+    geom_boxplot(
+        outlier.shape = NA,
+        alpha = 0.25,
+        width = 0.5,
+        fill = 'lightgrey'
+    ) + 
+    theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth=1,color='black', fill=NA),
+        panel.grid.major.y = element_line(linewidth=0.25, color='lightgrey'),
+        plot.title = element_text(hjust=0.5),
+        strip.background = element_blank(),
+        strip.text = element_text(face='bold')
+    ) + Seurat::NoLegend() + Seurat::RotatedAxis() 
+
+
+patch <- p + facet_grid(module ~ annotation, scales='free')
+
+pdf(paste0(fig_dir, 'test_pb_DMEs_Liver_Timepoint_box.pdf'), width=25, height=25)
+print(patch) 
+dev.off()
+
+
+```
+
+
+
+

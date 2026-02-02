@@ -1,0 +1,839 @@
+# launch an interactive node
+interactive 8 256G 12:00:00 genD
+
+# to launch:
+module load GCC
+conda activate compact
+
+
+```{r eval=FALSE}
+
+# input handling packages
+library(yaml)
+library(assertthat)
+
+# data wrangling & plotting packages
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+library(crayon)
+
+# single-cell & data analysis packages
+library(Seurat)
+library(Matrix)
+
+# network analysis
+library(WGCNA)
+library(hdWGCNA)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+
+# set the plotting theme
+theme_set(theme_cowplot())
+
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/hdWGCNA/TumorEpi/')
+
+# source helper functions
+source("scripts/helper_functions.R")
+source("scripts/plotting_functions.R")
+source("scripts/pseudobulk_functions.R")
+
+# load the configuration file:
+config_file <- "config.yml"
+config <- yaml::read_yaml(config_file)
+gen_opts <- config$general
+networks <- names(config$networks)
+
+fig_dir <- 'figures/'
+data_dir <- 'data/'
+
+# load the full Seurat object
+seurat_obj <- readRDS(config$seurat_path)
+
+# only keep the liver and lung networks 
+networks <- networks[grepl('Liver|Lung', networks)]
+
+# load the individual seurat objects from each network analysis
+seurat_list <- lapply(networks, function(wgcna_name){
+    print(wgcna_name)
+    cur_obj <- readRDS(paste0(gen_opts$out_dir, '/', wgcna_name, '/', gen_opts$data_dir, '/', wgcna_name, '_hdWGCNA.rds'))
+    cur_obj
+})
+names(seurat_list) <- networks
+
+```
+
+Calculate pairwise overlap of all modules across 
+
+```{r eval=FALSE}
+
+library(GeneOverlap)
+
+# aggregate modules into a single table
+modules <- do.call(rbind, lapply(networks, function(cur_net){
+    cur_obj <- SetActiveWGCNA(seurat_list[[cur_net]], wgcna_name = cur_net)
+    cur_modules <- GetModules(cur_obj)[,1:3] %>% subset(module != 'grey') %>% 
+        mutate(module = droplevels(module))
+    rownames(cur_modules) <- 1:nrow(cur_modules)
+    cur_modules$network <- cur_net 
+    cur_modules
+}))
+head(modules)
+
+modules1 <- modules
+modules2 <- modules
+
+
+mods1 <- unique(as.character(modules1$module)); mods1 <- mods1[mods1 != 'grey']
+mods2 <- unique(as.character(modules2$module)); mods2 <- mods2[mods2 != 'grey']
+
+
+genome.size <- length(union(modules1$gene_name, modules2$gene_name))
+
+# run overlaps between module gene lists and DEG lists:
+overlap_df <- do.call(rbind, lapply(mods1, function(cur_mod1){
+  cur_modules1_genes <- modules1 %>% subset(module == cur_mod1) %>% .$gene_name
+  cur_overlap_df <- do.call(rbind, lapply(mods2, function(cur_mod2){
+    print(paste0(cur_mod1, ' ', cur_mod2))
+    cur_modules2_genes <- modules2 %>% subset(module == cur_mod2) %>% .$gene_name
+    cur_overlap <- testGeneOverlap(newGeneOverlap(
+        cur_modules1_genes,
+        cur_modules2_genes,
+        genome.size=genome.size
+    ))
+    c(cur_overlap@odds.ratio, cur_overlap@pval, cur_overlap@Jaccard, length(cur_overlap@intersection))
+  })) %>% as.data.frame
+  colnames(cur_overlap_df) <- c('odds_ratio', 'pval', 'Jaccard', 'size_intersection')
+  cur_overlap_df$modules1 <- cur_mod1
+  cur_overlap_df$modules2 <- mods2
+
+  # module color:
+  #cur_overlap_df$color <- modules %>% subset(module == cur_mod) %>% .$color %>% unique
+  cur_overlap_df
+}))
+
+overlap_df$modules1 <- factor(as.character(overlap_df$modules1), levels=mods1)
+overlap_df$modules2 <- factor(as.character(overlap_df$modules2), levels=mods2)
+
+# adjust for multiple comparisons:
+overlap_df$fdr <- p.adjust(overlap_df$pval, method='fdr')
+
+# significance level:
+overlap_df$Significance <- gtools::stars.pval(overlap_df$fdr)
+overlap_df$Significance <- ifelse(
+  overlap_df$Significance == '.', '',
+  overlap_df$Significance
+)
+
+# hierarchical clustering of the module-module overlap matrix
+overlap_mat <- overlap_df %>% 
+    select(c(odds_ratio, modules1, modules2)) %>%
+    mutate(odds_ratio = ifelse(modules1 == modules2, 0, odds_ratio)) %>%
+    pivot_wider(values_from=odds_ratio, names_from=modules1) %>%
+    as.data.frame()
+rownames(overlap_mat) <- overlap_mat[,1] 
+overlap_mat <- as.matrix(overlap_mat[,2:ncol(overlap_mat)])
+dendro <- hclust(dist(overlap_mat))
+
+# order based on hierarchical clustering:
+overlap_df$modules1 <- factor(as.character(overlap_df$modules1), levels=dendro$labels[dendro$order])
+overlap_df$modules2 <- factor(as.character(overlap_df$modules2), levels=dendro$labels[dendro$order])
+
+
+overlap_df$pair <- paste0(as.character(overlap_df$modules1), '_', as.character(overlap_df$modules2))
+
+# save the pseudobulk module eigengene table:
+write.csv(overlap_df, file=paste0(data_dir, 'module_pairwise_overlap.csv'), quote=FALSE, row.names=FALSE)
+
+# plot the results as a heatmap:
+maxval <- 100
+plot_df <- overlap_df
+plot_df$odds_ratio <- ifelse(plot_df$odds_ratio > maxval, maxval, plot_df$odds_ratio)
+plot_df$textcolor <- ifelse(plot_df$odds_ratio > 0.7*maxval, 'white', 'black')
+plot_df$size_intersection <- ifelse(plot_df$fdr < 0.05, plot_df$size_intersection, NA)
+
+
+p1 <- plot_df %>%
+  ggplot(aes(x=modules1, y=modules2, fill=odds_ratio)) +
+  geom_tile() +
+  #geom_text(label=plot_df$Significance, vjust = 0.72, color=plot_df$textcolor) +
+  scale_fill_gradient(low='white', high='navy') +
+  RotatedAxis() +
+  labs(fill = 'Odds ratio') +
+  theme(
+    panel.border = element_rect(fill=NA, color='black', size=1),
+    axis.line.x = element_blank(),
+    axis.line.y = element_blank(),
+    axis.text.y = element_text(size=6),
+    axis.text.x = element_text(size=6)
+
+  ) +
+  coord_equal() + xlab('') + ylab('')
+
+pdf(paste0(fig_dir, 'module_pairwise_overlap.pdf'), width=16, height=16)
+print(p1) 
+dev.off()
+
+
+```
+
+Overlap analysis with CancerSEA
+
+```{r eval=FALSE}
+
+# load the CancerSEA pathways
+cancerSEA_dir <- '~/analysis/SERPENTINE/bin/CancerSEA/'
+cancerSEA_files <- dir(cancerSEA_dir)
+cancerSEA_df <- data.frame()
+for(file in dir(cancerSEA_dir)){
+    df <- read.table(paste0(cancerSEA_dir, file), header=TRUE)
+    pathway <- gsub('.txt', '', file)
+    df$Pathway <- pathway
+    cancerSEA_df <- rbind(cancerSEA_df, df)
+}
+
+
+modules1 <- modules
+modules2 <- cancerSEA_df %>% dplyr::rename(
+    module = Pathway,
+    gene_name = GeneName
+)
+
+
+mods1 <- unique(as.character(modules1$module)); mods1 <- mods1[mods1 != 'grey']
+mods2 <- unique(as.character(modules2$module)); mods2 <- mods2[mods2 != 'grey']
+
+
+genome.size <- length(union(modules1$gene_name, modules2$gene_name))
+
+# run overlaps between module gene lists and DEG lists:
+overlap_df <- do.call(rbind, lapply(mods1, function(cur_mod1){
+  cur_modules1_genes <- modules1 %>% subset(module == cur_mod1) %>% .$gene_name
+  cur_overlap_df <- do.call(rbind, lapply(mods2, function(cur_mod2){
+    print(paste0(cur_mod1, ' ', cur_mod2))
+    cur_modules2_genes <- modules2 %>% subset(module == cur_mod2) %>% .$gene_name
+    cur_overlap <- testGeneOverlap(newGeneOverlap(
+        cur_modules1_genes,
+        cur_modules2_genes,
+        genome.size=genome.size
+    ))
+    c(cur_overlap@odds.ratio, cur_overlap@pval, cur_overlap@Jaccard, length(cur_overlap@intersection))
+  })) %>% as.data.frame
+  colnames(cur_overlap_df) <- c('odds_ratio', 'pval', 'Jaccard', 'size_intersection')
+  cur_overlap_df$modules1 <- cur_mod1
+  cur_overlap_df$modules2 <- mods2
+
+  # module color:
+  #cur_overlap_df$color <- modules %>% subset(module == cur_mod) %>% .$color %>% unique
+  cur_overlap_df
+}))
+
+overlap_df$modules1 <- factor(as.character(overlap_df$modules1), levels=mods1)
+overlap_df$modules2 <- factor(as.character(overlap_df$modules2), levels=mods2)
+
+# adjust for multiple comparisons:
+overlap_df$fdr <- p.adjust(overlap_df$pval, method='fdr')
+
+# significance level:
+overlap_df$Significance <- gtools::stars.pval(overlap_df$fdr)
+overlap_df$Significance <- ifelse(
+  overlap_df$Significance == '.', '',
+  overlap_df$Significance
+)
+
+# # hierarchical clustering of the module-module overlap matrix
+# overlap_mat <- overlap_df %>% 
+#     select(c(odds_ratio, modules1, modules2)) %>%
+#     pivot_wider(values_from=odds_ratio, names_from=modules1) %>%
+#     as.data.frame()
+# rownames(overlap_mat) <- overlap_mat[,1] 
+# overlap_mat <- as.matrix(overlap_mat[,2:ncol(overlap_mat)])
+# dendro <- hclust(dist(overlap_mat))
+
+# # order based on hierarchical clustering:
+# overlap_df$modules1 <- factor(as.character(overlap_df$modules1), levels=dendro$labels[dendro$order])
+# overlap_df$modules2 <- factor(as.character(overlap_df$modules2), levels=dendro$labels[dendro$order])
+
+
+overlap_df$pair <- paste0(as.character(overlap_df$modules1), '_', as.character(overlap_df$modules2))
+
+# save the pseudobulk module eigengene table:
+write.csv(overlap_df, file=paste0(data_dir, 'CancerSEA_module_overlap.csv'), quote=FALSE, row.names=FALSE)
+
+# plot the results as a heatmap:
+maxval <- 25
+plot_df <- overlap_df
+plot_df$odds_ratio <- ifelse(plot_df$odds_ratio > maxval, maxval, plot_df$odds_ratio)
+plot_df$textcolor <- ifelse(plot_df$odds_ratio > 0.7*maxval, 'white', 'black')
+plot_df$size_intersection <- ifelse(plot_df$fdr < 0.05, plot_df$size_intersection, NA)
+
+
+p1 <- plot_df %>%
+  ggplot(aes(x=modules1, y=modules2, fill=odds_ratio)) +
+  geom_tile() +
+  #geom_text(label=plot_df$Significance, vjust = 0.72, color=plot_df$textcolor) +
+  scale_fill_gradient(low='white', high='navy') +
+  RotatedAxis() +
+  labs(fill = 'Odds ratio') +
+  theme(
+    panel.border = element_rect(fill=NA, color='black', size=1),
+    axis.line.x = element_blank(),
+    axis.line.y = element_blank(),
+    axis.text.y = element_text(size=6),
+    axis.text.x = element_text(size=6)
+
+  ) +
+  coord_equal() + xlab('') + ylab('')
+
+pdf(paste0(fig_dir, 'CancerSEA_moduleoverlap.pdf'), width=16, height=16)
+print(p1) 
+dev.off()
+
+
+```
+
+Pseudobulk analysis in Liver and Lung
+
+```{r eval=FALSE}
+
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+
+#---------------------------------------------------------#
+# Only keep Liver and Lung, excldue timepoint 3
+#---------------------------------------------------------#
+
+seurat_obj <- subset(
+    seurat_obj, 
+    subset = (
+        (Tissue %in% c('Liver', 'Lung')) &
+        (Timepoint %in% c(1, 2)) &
+        (Primary_tumor == "CRC")
+    )
+)
+
+# extract the counts matrix & cell-level meta-data from the Seurat object
+X <- GetAssayData(seurat_obj, layer='counts')
+meta <- seurat_obj@meta.data
+
+# create a pseudo-bulk SummarizedExperiment object
+se <- AggregatePseudobulk(
+    X, meta, 
+    replicate_col = "Patient", 
+    group_col = "Timepoint",
+    min_cells = 25
+)
+quantile(colData(se)$nCells)
+table(colData(se)$Tissue, colData(se)$Timepoint)
+
+# exclude patients that don't have both timepoints
+patients_keep <- intersect(
+    colData(se) %>% subset(Timepoint == 1) %>% .$Patient %>% unique,
+    colData(se) %>% subset(Timepoint == 2) %>% .$Patient %>% unique
+)
+
+se <- se[, colData(se)$Patient %in% patients_keep]
+table(colData(se)$Tissue, colData(se)$Timepoint)
+
+# normalize the pseudobulk SummarizedExperiment
+se <- NormalizeCounts(
+    se, 
+    method = 'VST',
+    assay_name = 'counts'
+)
+
+#---------------------------------------------------------#
+# Visualize QC metrics
+#---------------------------------------------------------#
+
+plot_df <- as.data.frame(colData(se))
+
+p <- plot_df %>% 
+    ggplot(aes(x = nUMI, y = nFeatures)) + 
+    ggrastr::rasterise(geom_point(aes(color = Tissue, size = nCells)), dpi=300) + 
+    RotatedAxis() +
+    scale_x_continuous(labels = scales::comma) +
+    scale_y_continuous(labels = scales::comma) +
+    theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth=1,color='black', fill=NA),
+        panel.grid.major.y = element_line(linewidth=0.25, color='lightgrey'),
+        panel.grid.major.x = element_line(linewidth=0.25, color='lightgrey'),
+        strip.text = element_text(face='bold', size=8),
+        plot.title = element_text(hjust=0.5)
+    ) + 
+    ggtitle("Pseudobulk nUMI detected vs. nFeatures detected")
+
+pdf(paste0(fig_dir, 'Pseudobulk_QC_nUMI_vs_nFeatures.pdf'), width=7, height=5)
+print(p) 
+dev.off()
+
+#---------------------------------------------------------#
+# PCA
+#---------------------------------------------------------#
+
+se <- PseudobulkPCA(
+    se,
+    assay_name = 'VST',
+    n_components = 10
+)
+
+p <- PlotPCAEmbedding(
+    se,
+    color_by = 'Tissue',
+)
+
+pdf(paste0(fig_dir, 'Pseudobulk_PCA_Tissue.pdf'), width=8, height=6)
+print(p) 
+dev.off()
+
+p <- PlotPCAEmbedding(
+    se,
+    color_by = 'leiden_1',
+)
+
+pdf(paste0(fig_dir, 'Pseudobulk_PCA_cluster.pdf'), width=7, height=5)
+print(p) 
+dev.off()
+
+p <- PlotPCAFeatures(
+    se,
+    feature = 'nCells',
+    adjust_outliers = 0.95
+) + scale_color_viridis_c()
+
+pdf(paste0(fig_dir, 'Pseudobulk_PCA_nCells.pdf'), width=7, height=5)
+print(p) 
+dev.off()
+
+p <- PlotPCAFeatures(
+    se,
+    feature = 'EPCAM',
+    assay_name = 'VST'
+) 
+
+pdf(paste0(fig_dir, 'Pseudobulk_PCA_EPCAM.pdf'), width=7, height=5)
+print(p) 
+dev.off() 
+
+#---------------------------------------------------------#
+# PCA Regression
+#---------------------------------------------------------#
+
+se <- PCRegression(
+    se,
+    covariates = c(
+        'Cluster', "Tissue", "Timepoint",
+        "nCells", "nUMI", "nFeatures"
+    ),
+    overwrite = TRUE
+)
+
+plot_df <- metadata(se)[["PCA"]]$regression 
+
+
+p <- plot_df %>% 
+    ggplot(aes(x = component, y = covariate)) + 
+    geom_point(
+        aes(size = -log10(fdr), color=adj_R2)
+    ) + 
+    geom_point(
+        data = subset(plot_df, fdr < 0.05),
+        aes(size = -log10(fdr)), color = 'black', shape = 21
+    ) +
+    coord_fixed() + 
+    scale_color_gradient2(low='seagreen', mid = 'whitesmoke', high='darkorchid4') +
+    theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth = 1, color = 'black', fill = NA),
+        panel.grid.major.y = element_line(linewidth = 0.25, color = 'lightgrey'),
+        panel.grid.major.x = element_line(linewidth = 0.25, color = 'lightgrey'),
+        plot.title = element_text(hjust = 0.5) 
+    ) +
+    scale_x_continuous(limits = c(1, max(plot_df$component))) + 
+    xlab('Principal Component') + ylab('') 
+
+pdf(paste0(fig_dir, 'Pseudobulk_PCA_regression.pdf'), width=12, height=6)
+print(p) 
+dev.off()
+
+
+# plot_df <- metadata(se)[["PCA"]]$level_regression %>%
+#     subset(model_term != '(Intercept)')
+
+
+# p <- plot_df %>% 
+#     ggplot(aes(x = component, y = model_term)) + 
+#     geom_point(
+#         aes(size = -log10(pval), color=estimate)
+#     ) + 
+#     geom_point(
+#         data = subset(plot_df, pval < 0.05),
+#         aes(size = -log10(pval)), color = 'black', shape = 21
+#     ) +
+#     coord_fixed() + 
+#     scale_color_gradient2(low='seagreen', mid = 'whitesmoke', high='darkorchid4') +
+#     theme(
+#         axis.line.x = element_blank(),
+#         axis.line.y = element_blank(),
+#         panel.border = element_rect(linewidth = 1, color = 'black', fill = NA),
+#         panel.grid.major.y = element_line(linewidth = 0.25, color = 'lightgrey'),
+#         panel.grid.major.x = element_line(linewidth = 0.25, color = 'lightgrey'),
+#         plot.title = element_text(hjust = 0.5) 
+#     ) +
+#     scale_x_continuous(limits = c(1, max(plot_df$component)))
+
+# pdf(paste0(fig_dir, 'Pseudobulk_PCA_regression_clusters.pdf'), width=12, height=6)
+# print(p) 
+# dev.off()
+
+#---------------------------------------------------------#
+# Investigate PCA loadings
+#
+# Which genes are loading highly to PC2?
+#---------------------------------------------------------#
+
+pc_loadings <- metadata(se)$PCA$loadings
+pca_mat <- metadata(se)$PCA$embedding
+
+x <- pc_loadings[,"PC2"]
+x[order(x)] %>% tail(25) %>% names
+x[order(x)] %>% head(25) %>% names
+
+cor(pca_mat[,"PC1"], colData(se)$nCells)
+cor(pca_mat[,"PC2"], colData(se)$nCells)
+cor(pca_mat[,"PC1"], colData(se)$nUMI)
+cor(pca_mat[,"PC2"], colData(se)$nUMI)
+
+```
+
+Pseudobulk Module Eigengenes 
+
+```{r eval=FALSE}
+
+#---------------------------------------------------------#
+# Calculate Pseudobulk module eigengenes,
+# create a MultiAssayExperiment 
+#---------------------------------------------------------#
+
+# aggregate modules into a single table
+modules <- do.call(rbind, lapply(networks, function(cur_net){
+    cur_obj <- SetActiveWGCNA(seurat_list[[cur_net]], wgcna_name = cur_net)
+    cur_modules <- GetModules(cur_obj)[,1:3] %>% subset(module != 'grey') %>% 
+        mutate(module = droplevels(module))
+    rownames(cur_modules) <- 1:nrow(cur_modules)
+    cur_modules$network <- cur_net 
+    cur_modules
+}))
+head(modules)
+
+# # use the vst-normalized dataset
+# X <- assays(se)$VST
+
+# # loop through each module and calculate the ME w/ WGCNA
+# mods <- unique(as.character(modules$module))
+# eigengene_list <- lapply(mods, function(mod) {
+#     print(mod)
+#     genes <- subset(modules, module == mod) %>% .$gene_name
+#     colors <- rep(mod, length(genes)); names(colors) <- genes
+#     ME <- WGCNA::moduleEigengenes(t(X[genes, , drop=FALSE]), colors = colors)$eigengenes
+#     return(ME[[1]])
+# })
+
+# MEs <- as.data.frame(do.call(cbind, eigengene_list))
+# colnames(MEs) <- mods; rownames(MEs) <- colnames(X)
+# # MEs$pseudobulk <- rownames(MEs)
+
+# # transpose so it's modules x Samples
+# MEs <- t(MEs)
+
+# # create a new SummarizedExperiment:
+# se_modules <- SummarizedExperiment(
+#     list(MEs = MEs),
+#     colData = colData(se)
+# )
+
+# # create a MultiAssayExperiment object:
+# mae <- MultiAssayExperiment(
+#     experiments = list(
+#         RNA = se,
+#         modules = se_modules
+#     ),
+#     colData = colData(se)
+# )
+
+#---------------------------------------------------------#
+# Calculate Pseudobulk decoupleR scores
+#
+# TODO
+#---------------------------------------------------------#
+
+library(decoupleR)
+
+#---------------------------------------------------------#
+# Pseudobulk differential module eigengene analysis
+#---------------------------------------------------------#
+
+library(limma)
+
+# update the timepoint column so limma doesn't freak out
+colData(se)$TP <-paste0("T", as.character(colData(se)$Timepoint))
+colData(se)$Cluster <-paste0("C", as.character(colData(se)$leiden_1))
+
+# calculate pseudobulk MEs
+se_MEs <- PseudobulkModuleEigengenes(se, modules)
+
+# create a MultiAssayExperiment object:
+mae <- MultiAssayExperiment(
+    experiments = list(
+        RNA = se,
+        modules = se_MEs
+    ),
+    colData = colData(se)
+)
+
+# Make a test comparison between 
+meta <- colData(mae)
+
+# define the current cluster
+clusters <- unique(colData(mae)$Cluster)
+
+# which modules to 
+networks_test <- c('Liver_T1', 'Liver_T2')
+modules_test <- as.character(unique(modules$module))
+
+cur_cluster <- 'C0'
+dme_df <- data.frame()
+for(cur_cluster in clusters){
+
+    print(cur_cluster)
+
+    # TODO: Make this more flexible
+    pb_keep <- meta %>% subset(
+        (Cluster == cur_cluster) & 
+        (TP %in% c('T1', 'T2'))
+    )
+
+    pb_keep$log_nUMI <- log10(pb_keep$nUMI)
+    pb_keep$log_nFeatures <- log10(pb_keep$nFeatures)
+
+    # get the module eigengene matrix:
+    MEs <- assays(experiments(mae)$modules)$MEs[modules_test, rownames(pb_keep)]
+
+    # set up the design matrix:
+    condition_factor <- factor(pb_keep$TP, levels = c("T1", "T2"))
+    # design <- model.matrix(~ 0 + condition_factor)
+    design <- model.matrix(~ 0 + condition_factor + nCells + log_nUMI, data = pb_keep)
+    condition_vec <- ifelse(condition_factor == 'T1', 0, 1)
+
+    # Rename the columns for cleaner output
+    colnames(design) <- gsub("condition_factor", "", colnames(design))
+
+    # Display the design matrix (optional, but helpful for verification)
+    head(design)
+
+    # see if we need to skip:
+    if(any(colSums(design) <= 2)){
+        print(paste0("Skipping ", cur_cluster, ' ...'))
+        next
+    }
+
+    # Define the contrast of interest
+    # We want to test the difference: Mean(Liver) - Mean(Lung)
+    contrast.matrix <- makeContrasts(T2_vs_T1 = T2 - T1,
+                                    levels = design)
+
+    # Fit the linear model to the transposed ME data
+    # Since MEs are continuous, scaled values, no voom transformation is needed.
+    fit <- lmFit(MEs, design)
+
+    # Apply the contrast to the fitted model
+    fit.cont <- contrasts.fit(fit, contrast.matrix)
+
+    # Use Empirical Bayes moderation to stabilize variance estimates 
+    # and calculate final statistics (t-statistics, p-values, logFC)
+    fit.cont <- eBayes(fit.cont)
+
+    # Get the results for the Liver_vs_Lung contrast
+    # adjust.method="BH" applies Benjamini-Hochberg FDR correction.
+    results <- topTable(fit.cont, 
+                        coef="T2_vs_T1", 
+                        number=Inf, 
+                        sort.by="P",
+                        adjust.method="BH")
+
+    # calculate the correlation
+    ME_cor <- apply(MEs, 1, function(x){
+        cor(x, condition_vec)
+    })
+
+    results$cor <- ME_cor[rownames(results)]
+
+    # add comparison info 
+    results$module <- rownames(results)
+    results$cluster <- cur_cluster
+    rownames(results) <- 1:nrow(results)
+
+    dme_df <- rbind(dme_df, results)
+
+}
+
+
+
+p <- dme_df %>% 
+    ggplot(aes(x = cor, y = -log10(P.Value))) + 
+    geom_point(aes(color = module)) +
+    geom_hline(yintercept = -log10(0.05), linetype='dashed', linewidth=0.5, color='grey') + 
+    xlim(c(-1,1))
+
+patch <- p + facet_wrap(~cluster, ncol=3) + NoLegend()
+
+pdf(paste0(fig_dir, 'test_pb_DMEs_Liver_Timepoint_v2.pdf'), width=8, height=8)
+print(patch) 
+dev.off()
+
+```
+
+Test Pseudobulk differential MEs when subsetting the data 
+
+```{r eval=FALSE}
+
+
+#---------------------------------------------------------#
+# Pseudobulk differential module eigengene analysis
+#---------------------------------------------------------#
+
+library(limma)
+
+# update the timepoint column so limma doesn't freak out
+colData(se)$TP <-paste0("T", as.character(colData(se)$Timepoint))
+colData(se)$Cluster <-paste0("C", as.character(colData(se)$leiden_1))
+
+cur_pseudobulks <- colData(se) %>% subset(
+    (Primary_tumor == 'CRC') & 
+    (Tissue == 'Liver') &
+    (TP %in% c('T1', 'T2')) &
+    (nCells >= 25)
+)
+
+# subset the SE object
+cur_se <- se[,rownames(cur_pseudobulks)]
+
+cur_se_modules <- PseudobulkModuleEigengenes(
+    cur_se, 
+    modules
+)
+
+# create a MultiAssayExperiment object:
+cur_mae <- MultiAssayExperiment(
+    experiments = list(
+        RNA = cur_se,
+        modules = cur_se_modules
+    ),
+    colData = colData(cur_se)
+)
+
+
+# Make a test comparison between 
+meta <- colData(cur_mae)
+
+# define the current cluster
+clusters <- unique(colData(cur_mae)$Cluster)
+
+# which modules to 
+networks_test <- c('Liver_T1', 'Liver_T2')
+modules_test <- as.character(unique(modules$module))
+
+cur_cluster <- 'C0'
+dme_df <- data.frame()
+for(cur_cluster in clusters){
+
+    print(cur_cluster)
+
+    # TODO: Make this more flexible
+    pb_keep <- meta %>% subset(
+        (Cluster == cur_cluster) 
+    )
+
+    # subset the MAE object
+    cur <- cur_mae[,rownames(pb_keep)]
+
+    # get the module eigengene matrix:
+    MEs <- assays(experiments(cur)$modules)$MEs[modules_test, rownames(pb_keep)]
+
+    # set up the design matrix:
+    condition_factor <- factor(pb_keep$TP, levels = c("T1", "T2"))
+    design <- model.matrix(~ 0 + condition_factor)
+    condition_vec <- ifelse(condition_factor == 'T1', 0, 1)
+
+    # Rename the columns for cleaner output
+    colnames(design) <- gsub("condition_factor", "", colnames(design))
+
+    # Display the design matrix (optional, but helpful for verification)
+    head(design)
+
+    # see if we need to skip:
+    if(any(colSums(design) <= 2)){
+        print(paste0("Skipping ", cur_cluster, ' ...'))
+        next
+    }
+
+    # Define the contrast of interest
+    # We want to test the difference: Mean(Liver) - Mean(Lung)
+    contrast.matrix <- makeContrasts(T2_vs_T1 = T2 - T1,
+                                    levels = design)
+
+    # Fit the linear model to the transposed ME data
+    # Since MEs are continuous, scaled values, no voom transformation is needed.
+    fit <- lmFit(MEs, design)
+
+    # Apply the contrast to the fitted model
+    fit.cont <- contrasts.fit(fit, contrast.matrix)
+
+    # Use Empirical Bayes moderation to stabilize variance estimates 
+    # and calculate final statistics (t-statistics, p-values, logFC)
+    fit.cont <- eBayes(fit.cont)
+
+    # Get the results for the Liver_vs_Lung contrast
+    # adjust.method="BH" applies Benjamini-Hochberg FDR correction.
+    results <- topTable(fit.cont, 
+                        coef="T2_vs_T1", 
+                        number=Inf, 
+                        sort.by="P",
+                        adjust.method="BH")
+
+    # calculate the correlation
+    ME_cor <- apply(MEs, 1, function(x){
+        cor(x, condition_vec)
+    })
+
+    results$cor <- ME_cor[rownames(results)]
+
+    # add comparison info 
+    results$module <- rownames(results)
+    results$cluster <- cur_cluster
+    rownames(results) <- 1:nrow(results)
+
+    dme_df <- rbind(dme_df, results)
+
+}
+
+
+
+p <- dme_df %>% 
+    ggplot(aes(x = cor, y = -log10(P.Value))) + 
+    geom_point(aes(color = module)) +
+    geom_hline(yintercept = -log10(0.05), linetype='dashed', linewidth=0.5, color='grey') + 
+    xlim(c(-1,1))
+
+patch <- p + facet_wrap(~cluster, ncol=3) + NoLegend()
+
+pdf(paste0(fig_dir, 'test_pb_DMEs_Liver_Timepoint_v2.pdf'), width=8, height=8)
+print(patch) 
+dev.off()
+
+```

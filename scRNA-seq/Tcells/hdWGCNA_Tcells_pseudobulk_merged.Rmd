@@ -1,0 +1,420 @@
+# launch an interactive node
+interactive 8 256G 12:00:00 genD
+
+# to launch:
+module load GCC
+conda activate compact
+
+
+```{r eval=FALSE}
+
+# input handling packages
+library(yaml)
+library(assertthat)
+
+# data wrangling & plotting packages
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+library(crayon)
+
+# single-cell & data analysis packages
+library(Seurat)
+library(Matrix)
+
+# network analysis
+library(WGCNA)
+library(hdWGCNA)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+library(limma)
+
+# set the plotting theme
+theme_set(theme_cowplot())
+
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/hdWGCNA/Tcells/')
+
+# source helper functions
+source("scripts/helper_functions.R")
+source("scripts/plotting_functions.R")
+source("scripts/pseudobulk_functions.R")
+
+# load the configuration file:
+config_file <- "config.yml"
+config <- yaml::read_yaml(config_file)
+gen_opts <- config$general
+networks <- names(config$networks)
+
+fig_dir <- 'figures/'
+data_dir <- 'data/'
+
+# load the full Seurat object
+seurat_obj <- readRDS(config$seurat_path)
+
+networks <- c("Liver_T1", "Liver_T2", "Lung_T1", "Lung_T2", "Primary_T1", "Primary_T2")
+
+# load the individual seurat objects from each network analysis
+seurat_list <- lapply(networks, function(wgcna_name){
+    print(wgcna_name)
+    cur_obj <- readRDS(paste0(gen_opts$out_dir, '/', wgcna_name, '/', gen_opts$data_dir, '/', wgcna_name, '_hdWGCNA.rds'))
+    cur_obj
+})
+names(seurat_list) <- networks
+
+# load the TCAT weights:
+tcat_weights <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/TCAT_reference_weights.csv")
+rownames(tcat_weights) <- gsub('[-/]', '.', tcat_weights$X)
+tcat_weights <- tcat_weights[,-1]
+
+# # re-load the MultiAssayExperiment object:
+# mae <- readRDS(paste0(data_dir, "Tcells_pseudobulk_MAE.rds"))
+
+# # re-load the MAE object w/ meta-module info:
+# mae <- readRDS(paste0(data_dir, "Tcells_pseudobulk_MAE_metamodules.rds"))
+
+
+```
+
+Merge similar annotations based on pairwise correlations of cluster PCs:
+
+```{r eval=FALSE}
+
+# "Tregs", "Tregs activated", "Tregs proliferating" (Tregs)
+# "MAIT-17", "Th-17", "Tgd-17" (17)
+# "CD8 NK-like", "NK", "NK-Tgd", "Tgd-V1" (NK-like)
+# "T proliferating"
+# add "Th-1" to "CD4 follicular helper"
+# "CD8 metabolic", "CD8 IFN" --> CD8 other
+# "CD8 pre-exhausted" "CD8 resident exhausted" --> CD8 exhausted
+# "CD8 activated", "CD8 resident activated"
+# add "CD4 central memory pre-Tfh" to "CD4 central memory"
+
+
+cd4_clusters <- c("Tregs activated", "CD4 follicular helper", "Tgd-V1", "Tregs", "Th-17", "Th-17", "Tregs proliferating", "CD4 central memory", "CD4 central memory pre-Tfh")
+
+cd8_clusters <- c("CD8 resident", "T proliferating", "CD8 activated", "CD8 NK-like", "CD8 resident activated", "CD8 pre-exhausted", "CD8 IFN", "CD8 effector", "CD8 resident exhausted", "CD8 metabolic")
+
+nk_clusters <- c('NK-Tgd', "NK")
+
+seurat_obj$annotation_lv1 <- ifelse(seurat_obj$annotation %in% cd4_clusters, "CD4", ifelse(seurat_obj$annotation %in% cd8_clusters, "CD8", ifelse(seurat_obj$annotation %in% nk_clusters, "NK", "Other")))
+
+
+
+seurat_obj$Patient_Timepoint <- paste0(seurat_obj$Patient, ':T', seurat_obj$Timepoint)
+
+# extract the counts matrix & cell-level meta-data from the Seurat object
+X <- GetAssayData(seurat_obj, layer='counts')
+meta <- seurat_obj@meta.data
+
+# create a pseudo-bulk SummarizedExperiment object
+se <- AggregatePseudobulk(
+    X, meta, 
+    replicate_col = "Patient_Timepoint", 
+    group_col = "annotation_lv1",
+    min_cells = 50
+)
+
+# select groups of interest (CD*)
+se <- se[,
+    (colData(se)$Tissue %in% c('Liver', 'Lung')) &
+    (colData(se)$Timepoint %in% c(1,2)) &
+    (colData(se)$Primary_tumor == 'CRC') &
+    (colData(se)$annotation_lv1 %in% c('CD8', 'CD4'))
+]
+
+# exclude patients that don't have both timepoints
+patients_keep <- intersect(
+    colData(se) %>% subset(Timepoint == 1) %>% .$Patient %>% unique,
+    colData(se) %>% subset(Timepoint == 2) %>% .$Patient %>% unique
+)
+
+se <- se[, colData(se)$Patient %in% patients_keep]
+table(colData(se)$Tissue, colData(se)$Timepoint)
+
+# Remove genes with zero variance
+X_pb <- assays(se)$counts
+good_genes <- names(which(apply(X_pb, 1, sd) != 0))
+se <- se[good_genes,]
+
+
+# normalize the pseudobulk SummarizedExperiment
+se <- NormalizeCounts(
+    se, 
+    method = 'VST',
+    assay_name = 'counts'
+)
+
+#---------------------------------------------------------#
+# Calculate module eigengenes
+#---------------------------------------------------------#
+
+
+modules <- read.csv(file=paste0(data_dir, 'Tcell_modules_combined.csv'))
+mods <- as.character(unique(modules$module))
+mods <- mods[!grepl("Poor|Doublet", mods)]
+modules <- subset(modules, module %in% mods)
+
+# calculate MEs for each of these modules
+se_modules <- PseudobulkModuleEigengenes(
+    se, 
+    modules = modules,
+    assay_name = "VST",
+    new_assay_name = "MEs"
+)
+
+
+#---------------------------------------------------------#
+# Calculate pseudo-bulk decoupleR ULM scores
+#---------------------------------------------------------#
+
+library(decoupleR)
+
+
+# define the expression matrix to use
+X <- assays(se)$VST
+
+signature_df <- data.frame()
+for(cur_net in unique(modules$network)){
+
+  print(cur_net)
+  cur_df <- subset(modules, network == cur_net) 
+
+  cur_signature_df <- decoupleR::run_ulm(
+    mat = X,
+    net = cur_df,
+    .source = 'module',
+    .target = 'gene_name',
+    .mor = 'weight'
+  )
+
+  cur_signature_df$network <- cur_net
+  signature_df <- rbind(signature_df, cur_signature_df)
+
+}
+
+# cast from long to wide:
+signature_mat <- signature_df %>% 
+    dplyr::select(source, condition, score) %>%
+    tidyr::pivot_wider(
+        names_from = condition,
+        values_from = score,
+        values_fill = 0
+    ) %>%
+    as.data.frame()
+rownames(signature_mat) <- signature_mat$source
+signature_mat <- as.matrix(signature_mat[,-1])
+
+# re-order to match the se_modules object
+signature_mat <- signature_mat[rownames(se_modules), colnames(se_modules)]
+
+# add to the se_modules object
+assays(se_modules)$decoupleR_ULM <- signature_mat
+
+#---------------------------------------------------------#
+# Create a MultiAssayExperiment (MAE) object 
+# and save the results
+#---------------------------------------------------------#
+
+mae <- MultiAssayExperiment(
+    experiments = list(
+        RNA = se,
+        modules = se_modules
+    ),
+    colData = colData(se)
+)
+
+
+#---------------------------------------------------------#
+# Differential expression of co-expression modules
+#---------------------------------------------------------#
+
+
+# subset by Tissue 
+assay_use <- 'decoupleR_ULM'
+
+# update the timepoint column so limma doesn't freak out
+colData(mae)$TP <-paste0("T", as.character(colData(mae)$Timepoint))
+
+# define the current MAE object by subsetting the Tissue:
+cur_tissue <- 'Liver'
+#cur_tissue <- 'Lung'
+
+cur_mae <- mae[, colData(mae)$Tissue == cur_tissue]
+
+# Make a test comparison between 
+meta <- colData(cur_mae)
+
+# define the current cluster
+clusters <- unique(colData(cur_mae)$annotation_lv1)
+
+# which modules to 
+networks_test <- c('Lung_T1', 'Lung_T2')
+modules_test <- modules[grepl(paste0(cur_tissue, "_T1"), modules$module),] %>% .$module %>% as.character() %>% unique()
+
+cur_cluster <- 'CD4'
+dme_df <- data.frame()
+for(cur_cluster in clusters){
+
+    print(cur_cluster)
+
+    pb_keep <- meta %>% subset(
+        (annotation_lv1 == cur_cluster) 
+    )
+
+    # subset the MAE object
+    cur <- cur_mae[,rownames(pb_keep)]
+
+    # get the module eigengene matrix:
+    MEs <- assays(experiments(cur)$modules)[[assay_use]]
+    MEs <- MEs[modules_test,]
+
+    # set up the design matrix:
+    condition_factor <- factor(pb_keep$TP, levels = c("T1", "T2"))
+    patient_factor <- factor(pb_keep$Patient)
+    n_cells_scaled  <- as.numeric(scale(log10(pb_keep$nCells))) # Scale to keep coefficients comparable
+    condition_vec <- ifelse(condition_factor == 'T1', 0, 1)
+
+    # # see if we need to skip:
+    if(any(table(condition_factor) < 3)){
+        print(paste0("Skipping ", cur_cluster, ' ...'))
+        next
+    }
+
+    # design <- model.matrix(~ 0 + condition_factor)
+    design <- model.matrix(~ patient_factor + condition_factor + n_cells_scaled)
+
+    # Rename the columns for cleaner output
+    colnames(design) <- gsub("condition_factor", "", colnames(design))
+
+    # Display the design matrix (optional, but helpful for verification)
+    head(design)
+
+    # CHECK: Is the design matrix estimable?
+    check_est <- limma::nonEstimable(design)
+
+    if(!is.null(check_est)){
+        cat(paste0("\nSkipping ", cur_cluster, " - Collinearity detected in: ", 
+                paste(check_est, collapse=", "), "\n"))
+        next 
+    }
+
+    # Fit the linear model to the transposed ME data
+    # Since MEs are continuous, scaled values, no voom transformation is needed.
+    fit <- lmFit(MEs, design)
+    fit <- tryCatch({
+        eBayes(fit, robust = TRUE, trend = TRUE)
+    }, error = function(e){
+        cat(paste0("\nSkipping ", cur_cluster, " - eBayes failed: ", e$message, "\n"))
+        return(NULL)
+    })
+    if (is.null(fit)){ next}
+
+    results <- topTable(fit, 
+                    coef = ncol(design), 
+                    number = Inf, 
+                    sort.by = "P",
+                    adjust.method = "BH")
+
+    # add comparison info 
+    results$module <- rownames(results)
+    results$cluster <- cur_cluster
+    rownames(results) <- 1:nrow(results)
+
+    dme_df <- rbind(dme_df, results)
+
+}
+
+head(dme_df)
+
+subset(dme_df, P.Value < 0.05)
+
+subset(dme_df, module == 'Liver_T1_1')
+
+
+
+#---------------------------------------------------------#
+# Box plot...?
+#---------------------------------------------------------#
+
+
+
+subset(dme_df, P.Value < 0.05)
+
+cur_mod <- "Liver_T1_1" # Tgd-v1
+cur_mod <- "Liver_T1_11"
+
+plot_df <- as.data.frame(colData(mae))
+MEs <- assays(experiments(mae)$modules)[[assay_use]]
+
+plot_df$value <- as.numeric(MEs[cur_mod, rownames(plot_df)])
+
+p <- plot_df %>%
+    subset(Tissue == 'Liver') %>%
+    ggplot(aes(x = annotation_lv1 , y = value)) + 
+    geom_boxplot(
+        aes(fill = as.factor(Timepoint)),
+        outlier.shape = NA,
+        alpha = 0.25,
+        width = 0.5,
+    ) +
+    # ggrastr::rasterise(ggbeeswarm::geom_quasirandom(
+    #     aes(color=as.factor(Timepoint)),
+    #     method = 'pseudorandom',
+    #     size = 3
+    # ), dpi = 300) + 
+    RotatedAxis()
+
+pdf(paste0(fig_dir, 'test_pb_filtered_DMEs_Liver_Timepoint_', cur_mod,'_box.pdf'), width=12, height=6)
+print(p) 
+dev.off()
+
+
+
+
+MEs <- assays(experiments(mae)$modules)[[assay_use]]
+
+cur_mod <- 'Liver_T1_1'
+cur_mod <- "Liver_T1_11"
+
+plot_df <- as.data.frame(colData(mae))
+MEs <- assays(experiments(mae)$modules)[[assay_use]]
+
+plot_df$value <- as.numeric(MEs[cur_mod, rownames(plot_df)])
+
+
+p <- plot_df %>%
+    subset(Tissue == 'Liver') %>%
+    ggplot(aes(x = Timepoint , y = value)) + 
+    geom_boxplot(
+        aes(fill = as.factor(Timepoint)),
+        outlier.shape = NA,
+      #  alpha = 0.25,
+        width = 0.5,
+        position = position_dodge(width = 0.8) # Explicitly set dodge width
+    ) +
+    ggrastr::rasterise(
+        ggbeeswarm::geom_quasirandom(
+            aes(group = as.factor(Timepoint), shape=Microsatellite_status),
+            dodge.width = 0.8,   # This MUST match the boxplot dodge width
+            size = 1,
+            alpha = 1
+        ), dpi = 300) +
+   #  ggpubr::stat_compare_means(method = 'wilcox') + 
+    RotatedAxis()
+
+pdf(paste0(fig_dir, 'boxplot_', cur_mod, '_2.pdf'), width=4.5, height=4)
+print(p) 
+dev.off()
+
+pdf(paste0(fig_dir, 'boxplot_', cur_mod, '_split2.pdf'), width=6, height=4)
+p + facet_wrap(~ annotation_lv1)
+dev.off()
+
+
+
+```

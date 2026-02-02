@@ -1,0 +1,58 @@
+
+Load the data from Pelka et al 2021 
+
+```{r eval=FALSE}
+
+library(Seurat)
+library(Matrix)
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+library(MetBrewer)
+library(ggpubr)
+theme_set(theme_cowplot())
+
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/external_data/Pelka_2021/')
+data_dir <- 'data/'
+fig_dir <- 'figures/'
+
+# load the counts matrix:
+counts_file <- "/home/groups/singlecell/smorabito/analysis/SERPENTINE/external_data/Pelka_2021/data/GSE178341_crc10x_full_c295v4_submit.h5"
+counts_mat <- Seurat::Read10X_h5(counts_file)
+
+# load the meta-data:
+clinical_meta <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/external_data/Pelka_2021/data/GSE178341_crc10x_full_c295v4_submit_metatables.csv")
+
+# load cluster meta-data
+cluster_meta <- read.csv("/home/groups/singlecell/smorabito/analysis/SERPENTINE/external_data/Pelka_2021/data/GSE178341_crc10x_full_c295v4_submit_cluster.csv")
+
+# merge into one table
+meta <- cbind(clinical_meta, cluster_meta)
+rownames(meta) <- meta$cellID 
+
+# create the Seurat object
+seurat_obj <- CreateSeuratObject(
+    counts = counts_mat,
+    meta.data = meta
+) 
+
+# save the unprocessed object:
+saveRDS(seurat_obj, file=paste0(data_dir, 'Pelka2021_unprocessed.rds'))
+
+#---------------------------------------------------------------
+# Run the "default" pipeline (PCA-based, no integration)
+#---------------------------------------------------------------
+
+# re-load
+seurat_obj <- readRDS(paste0(data_dir, 'Pelka2021_unprocessed.rds'))
+
+# subset for Tumor samples:
+seurat_obj <- subset(seurat_obj, SPECIMEN_TYPE == "T")
+
+seurat_obj <- NormalizeData(seurat_obj)
+seurat_obj <- FindVariableFeatures(seurat_obj)
+seurat_obj <- ScaleData(seurat_obj)
+
+
+

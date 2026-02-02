@@ -1,0 +1,512 @@
+
+Author: Sam Morabito
+Date: 22-10-2025
+Project: SERPENTINE
+
+The goal of this notebook is to create a Seurat object from individual components generated from our Scanpy analysis. There are several other tools that exist which aim to do this process (zellkonverter, SeuratDisk, etc), but in the past I have not had success running these tools. The workaround solution is to save individual components (expression matrix, metadata, etc) in Scanpy, and then load them into R to create a Seurat object.
+
+```{bash eval=FALSE}
+
+# request interactive node
+# 8 threads, 256G mem, 10 hours
+interactive 8 256G 10:00:00 genD
+
+# activate conda env
+conda activate mpa
+R
+```
+
+Create the Seurat object for the full SERPENTINE dataset 
+(clustered only using PCA to define level 1 clusters, 
+ no additional integration performed)
+
+```{r eval=FALSE}
+
+library(Seurat) # packageVersion 5.1.0
+library(Matrix)
+library(tidyverse)
+library(cowplot)
+library(patchwork)
+library(arrow)
+theme_set(theme_cowplot())
+
+# set the project directory 
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025')
+data_dir <- 'data/'
+fig_dir <- 'figures/'
+
+dataset_name <- "SERPENTINE_PCA_140725_annotated"
+
+# load the raw & normalized counts:
+X_raw <- Matrix::readMM(paste0(data_dir, dataset_name, '_counts.mtx'))
+
+# load the cell meta-data (.obs table)
+obs_df <- read.table(
+    paste0(data_dir, dataset_name, '_obs.csv'), 
+    sep=',', row.names=1, header=TRUE
+)
+
+# load the gene meta-data (.var table)
+var_df <- read.table(
+    paste0(data_dir, dataset_name, '_var.csv'), 
+    sep=',', row.names=1, header=TRUE
+)
+
+# add gene & cell names to the expression matrices:
+colnames(X_raw) <- rownames(obs_df)
+rownames(X_raw) <- rownames(var_df)
+
+#----------------------------------------------------------#
+# Create the Seurat object
+#----------------------------------------------------------#
+
+seurat_obj <- Seurat::CreateSeuratObject(
+    counts = X_raw,
+    meta.data = obs_df,
+    assay = 'RNA',
+    min.features = 0,
+    min.cells = 0,
+    project = 'SERPENTINE'
+)
+dim(seurat_obj)
+
+# set VariableFeatures in the RNA assay
+variable_feats <- subset(var_df, highly_variable == 'True') %>% rownames()
+VariableFeatures(seurat_obj) <- variable_feats
+
+# normalize dataset
+seurat_obj <- NormalizeData(seurat_obj)
+
+#----------------------------------------------------------#
+# Add embeddings to the Seurat object
+#----------------------------------------------------------#
+
+# load the embeddings:
+embedding_names <- c("X_pca", "X_umap")
+for(cur_name in embedding_names){
+    print(cur_name)
+    emb <- as.matrix(read.table(
+        paste0(data_dir, dataset_name, '_', cur_name,'.csv'), 
+        sep=',', row.names=1, header=TRUE
+    ))
+    rownames(emb) <- colnames(seurat_obj)
+    colnames(emb) <- paste0(cur_name, 1:ncol(emb))
+    seurat_obj@reductions[[cur_name]] <- Seurat::CreateDimReducObject(
+        emb, key = cur_name, assay = 'RNA'
+    )
+}
+
+#----------------------------------------------------------#
+# Add cell neighborhood graphs to the Seurat object
+#----------------------------------------------------------#
+
+graph_names <- c('distances', 'connectivities')
+for(cur_name in graph_names){
+    print(cur_name)
+    cur_graph <- Matrix::readMM(paste0(data_dir, dataset_name, '_', cur_name,'.mtx'))
+    rownames(cur_graph) <- colnames(seurat_obj)
+    colnames(cur_graph) <- colnames(seurat_obj)
+    seurat_obj@graphs[cur_name] <- Seurat::as.Graph(cur_graph)
+}
+
+#----------------------------------------------------------#
+# Remove the nCount and nFeature columns
+#----------------------------------------------------------# 
+
+tmp <- colnames(seurat_obj@meta.data)
+tmp <- tmp[!grepl('nCount', tmp)]
+tmp <- tmp[!grepl('nFeature', tmp)]
+seurat_obj@meta.data <- seurat_obj@meta.data[,tmp]
+
+#----------------------------------------------------------#
+# Make a simple plot as a test 
+#----------------------------------------------------------#
+
+p <- DimPlot(seurat_obj, group.by='cell_type', raster=TRUE) + 
+    coord_equal() + hdWGCNA::umap_theme()
+
+pdf(paste0(fig_dir, 'SERPENTINE_seurat_umap.pdf'), width=12, height=8)
+p 
+dev.off()
+
+#----------------------------------------------------------#
+# save the object
+#----------------------------------------------------------# 
+
+saveRDS(seurat_obj, file=  paste0(data_dir, dataset_name, '.rds'))
+
+```
+
+Create the Seurat object for the Chen et al dataset 
+
+```{r eval=FALSE}
+
+
+
+```
+
+Create the Seurat object for the T cell compartment.
+
+```{r eval=FALSE}
+
+library(Seurat) # packageVersion 5.1.0
+library(Matrix)
+library(tidyverse)
+library(cowplot)
+library(patchwork)
+library(arrow)
+theme_set(theme_cowplot())
+
+# set the project directory 
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/')
+data_dir <- 'data/'
+fig_dir <- 'figures/'
+
+# define the cell type of interest
+cur_celltype <- 'Tcells'
+
+
+# load the raw & normalized counts:
+X_raw <- Matrix::readMM(paste0(data_dir, cur_celltype, '_integrated_annotated_counts.mtx'))
+X_norm <- Matrix::readMM(paste0(data_dir, cur_celltype, '_integrated_annotated_lognorm.mtx'))
+
+# load the cell meta-data (.obs table)
+obs_df <- read.table(
+    paste0(data_dir, cur_celltype, '_integrated_annotated_obs.csv'), 
+    sep=',', row.names=1, header=TRUE
+)
+
+# load the gene meta-data (.var table)
+var_df <- read.table(
+    paste0(data_dir, cur_celltype, '_integrated_annotated_var.csv'), 
+    sep=',', row.names=1, header=TRUE
+)
+
+# add gene & cell names to the expression matrices:
+colnames(X_raw) <- rownames(obs_df)
+colnames(X_norm) <- rownames(obs_df)
+rownames(X_raw) <- rownames(var_df)
+rownames(X_norm) <- rownames(var_df)
+
+#----------------------------------------------------------#
+# Create the Seurat object
+#----------------------------------------------------------#
+
+seurat_obj <- Seurat::CreateSeuratObject(
+    counts = X_raw,
+    data = X_norm,
+    meta.data = obs_df,
+    assay = 'RNA',
+    min.features = 0,
+    min.cells = 0,
+    project = 'SERPENTINE'
+)
+dim(seurat_obj)
+
+# set VariableFeatures in the RNA assay
+variable_feats <- subset(var_df, highly_variable == 'True') %>% rownames()
+VariableFeatures(seurat_obj) <- variable_feats
+
+
+# check the response column, is this data missing for the Chen et al dataset?
+
+# response col is msissing from Chen dataset, what is going on?
+table(seurat_obj$Response)
+
+#----------------------------------------------------------#
+# Add embeddings to the Seurat object
+#----------------------------------------------------------#
+
+# load the embeddings:
+embedding_names <- c("X_pca_CellANOVA", "Cmat", "X_umap")
+for(cur_name in embedding_names){
+    print(cur_name)
+    emb <- as.matrix(read.table(
+        paste0(data_dir, cur_celltype, '_integrated_annotated_', cur_name,'.csv'), 
+        sep=',', row.names=1, header=TRUE
+    ))
+    rownames(emb) <- colnames(seurat_obj)
+    colnames(emb) <- paste0(cur_name, 1:ncol(emb))
+    seurat_obj@reductions[[cur_name]] <- Seurat::CreateDimReducObject(
+        emb, key = cur_name, assay = 'RNA'
+    )
+}
+
+#----------------------------------------------------------#
+# Add cell neighborhood graphs to the Seurat object
+#----------------------------------------------------------#
+
+graph_names <- c('distances', 'connectivities')
+for(cur_name in graph_names){
+    print(cur_name)
+    cur_graph <- Matrix::readMM(paste0(data_dir, cur_celltype, '_integrated_annotated_obsp_', cur_name,'.mtx'))
+    rownames(cur_graph) <- colnames(seurat_obj)
+    colnames(cur_graph) <- colnames(seurat_obj)
+    seurat_obj@graphs[cur_name] <- Seurat::as.Graph(cur_graph)
+}
+
+#----------------------------------------------------------#
+# Add CellANOVA corrected matrix as new Assays
+#----------------------------------------------------------#
+
+# load the gene meta-data (.var table)
+var_df_cnova <- read.table(
+    paste0(data_dir, cur_celltype, '_integrated_annotated_CellANOVA_var.csv'), 
+    sep=',', row.names=1, header=TRUE
+)
+
+# somehow does not work?
+assay_names <- c('corrected', 'denoised', 'main_effect', 'trt_effect')
+for(cur_name in assay_names){
+    print(cur_name)
+    cur_X <- as.matrix(arrow::read_feather(
+        paste0(data_dir, cur_celltype, '_integrated_annotated_CellANOVA_', cur_name,'.feather')
+    ))
+    rownames(cur_X) <- var_df_cnova$gene
+    colnames(cur_X) <- colnames(seurat_obj)
+    seurat_obj[[cur_name]] <- SeuratObject::CreateAssay5Object(cur_X)
+}
+
+#----------------------------------------------------------#
+# Remove the nCount and nFeature columns
+#----------------------------------------------------------# 
+
+tmp <- colnames(seurat_obj@meta.data)
+tmp <- tmp[!grepl('nCount', tmp)]
+tmp <- tmp[!grepl('nFeature', tmp)]
+seurat_obj@meta.data <- seurat_obj@meta.data[,tmp]
+
+#----------------------------------------------------------#
+# Fix / modify metadata columns as needed
+#----------------------------------------------------------# 
+
+# replace the greek letters in the lv2 annotations
+# the greek letters cause some problems when plotting in R
+seurat_obj$lv2 <- stringr::str_replace(seurat_obj$lv2, 'γδ', 'gd')
+seurat_obj$lv2 <- stringr::str_replace(seurat_obj$lv2, '/', '-')
+seurat_obj$lv2 <- stringr::str_replace(seurat_obj$lv2, '[+]', 'pos')
+
+table(stringr::str_replace(seurat_obj$lv2, '/', '-'))
+
+# add a simpified variable for the response 
+
+# # this totally isn't correct, what is wrong with me
+# seurat_obj$Response_simple <- ifelse(
+#     seurat_obj$Response == 'Progression Disease', 'Non-response', 'Response'
+# )
+# seurat_obj$Response_simple <- ifelse(seurat_obj$Response == 'Missing', 'Missing', seurat_obj$Response_simple)
+
+# # add a column for Liver met yes or no 
+# liver_mets <- c('Patient 01', 'Patient 02', 'Patient 03', 'Patient 05', 'Patient 07', 'Patient 08', 'Patient 10', 'Patient 14', 'Patient 16', 'Patient 18')
+
+# seurat_obj$Liver_met <- ifelse(seurat_obj$Patient %in% liver_mets, 'Yes', 'No')
+# seurat_obj$Liver_met <- ifelse(seurat_obj$dataset == 'Chen2024', NA, seurat_obj$Liver_met)
+
+saveRDS(seurat_obj, file=  "/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcells_integrated_annotated_seurat.rds")
+
+# re-load the object
+seurat_obj <- readRDS(file=  "/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/Tcells/data/Tcells_integrated_annotated_seurat.rds")
+
+
+
+
+#----------------------------------------------------------#
+# Groups for comparison?
+#----------------------------------------------------------#
+
+tmp <- seurat_obj@meta.data %>% subset(
+    (Microsatellite_status == 'MSS') &
+    (Tumor_Type == 'CRC') &
+    (Tissue %in% c("Liver met", "Lung met", "Lymph node")) &
+    (Timepoint == 1)
+)
+
+table(tmp$Patient, tmp$Liver_met)
+
+# problem: Where is the data for Patient 19 Screening timepoint??? 
+tmp2 <- subset(seurat_obj@meta.data, Patient == 'Patient 19')
+
+seurat_obj@meta.data %>% subset(
+    Replicate == 'SPE_1_19_SCR_A_FRESH_1'
+) %>% head
+
+
+subset(seurat_obj@meta.data, Timepoint == 1) %>% 
+    .$Patient %>% table
+
+# 1, 2, 3, 10, 14
+# vs.
+# 15, 17, 19, 20
+
+table(tmp$Liver_met, tmp$Replicate)
+
+table(tmp$Liver_met, tmp$Patient)
+
+table(tmp$Tissue)
+
+#----------------------------------------------------------#
+# pairwise correlation of clusters
+#----------------------------------------------------------#
+
+PCs <- seurat_obj@reductions$X_pca_CellANOVA@cell.embeddings[,1:30]
+
+cluster_col <- 'lv2'
+clusters <- as.character(unique(seurat_obj@meta.data[,cluster_col]))
+
+cor_mat <- matrix(,nrow=length(clusters), ncol=length(clusters))
+for(i in 1:length(clusters)){
+    for(j in 1:length(clusters)){
+        print(paste0(i,j))
+        cl_i <- clusters[i]
+        cl_j <- clusters[j]
+
+        if(!is.na(cor_mat[j,i])){
+            cor_mat[i,j] <- cor_mat[j,i]
+        }
+ 
+        bcs_i <- subset(seurat_obj@meta.data, get(cluster_col) == cl_i) %>% rownames()
+        bcs_j <- subset(seurat_obj@meta.data, get(cluster_col) == cl_j) %>% rownames()
+
+        PCs_i <- colSums(PCs[bcs_i,]) / length(bcs_i)
+        PCs_j <- colSums(PCs[bcs_j,]) / length(bcs_j)
+
+        cor_mat[i,j] <- cor(PCs_i, PCs_j)
+
+    }
+}
+colnames(cor_mat) <- clusters; rownames(cor_mat) <- clusters
+
+
+dendrogram <- hclust(dist(cor_mat))
+
+layout <- ggraph::create_layout(dendrogram, layout='dendrogram')
+
+p1 <- ggraph(dendrogram, 'dendrogram', height = height) + 
+  geom_edge_elbow() + coord_flip() + theme(
+    plot.margin = margin(c(0,0,0,0))
+  )
+  #geom_node_point(aes(filter = leaf)) 
+  #geom_node_text(aes(filter = leaf, label=label), angle=90 , hjust=1, nudge_y=-0.1) +
+ # ylim(-2.5, NA) 
+
+plot_df <- reshape2::melt(cor_mat[dendrogram$order, dendrogram$order])
+p2 <- plot_df %>% 
+    ggplot(aes(x=Var1, y=Var2, fill=value)) + 
+    geom_tile() +
+    scale_fill_gradient2(high='darkgoldenrod3', mid='whitesmoke', low='dodgerblue') + 
+    RotatedAxis() + coord_fixed() +
+    ylab('') + xlab('') +
+    theme(
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        plot.margin = margin(c(0,0,0,0)),
+        legend.position='bottom',
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth=1, fill=NA, color='black'),
+        plot.title = element_text(hjust=0.5)
+    ) +
+    ggtitle('Pairwise correlation of lv2 T cell clusters')
+
+patch <- (p2 | p1) + plot_layout(widths=c(3, 1)) 
+
+pdf(paste0(fig_dir, 'lv2_cluster_dendrogram.pdf'), width=9, height=6)
+patch
+dev.off()
+
+
+# re-set the factor levels:
+seurat_obj@meta.data[,cluster_col] <- factor(
+    as.character(seurat_obj@meta.data[,cluster_col] ),
+    levels = dendrogram$labels
+)
+
+#----------------------------------------------------------#
+# save the resulting Seurat object
+#----------------------------------------------------------#
+
+# taking a suuuuuuuuuuper long time. 
+saveRDS(seurat_obj, file=paste0(data_dir, cur_celltype, '_integrated_annotated_CellANOVA_seurat.rds'))
+
+# Need to make another object without the CellANOVA assays, because I likely won't use it super often.
+for(cur_assay in assay_names){
+    seurat_obj[[cur_assay]] <- NULL
+}
+
+saveRDS(seurat_obj, file=paste0(data_dir, cur_celltype, '_integrated_annotated_seurat.rds'))
+
+```
+
+
+```{r eval=FALSE}
+
+# re-load the dataset (if necessary)
+seurat_obj <- readRDS(file=paste0(data_dir, cur_celltype, '_integrated_annotated_CellANOVA_seurat.rds'))
+
+#----------------------------------------------------------#
+# Make a simple plot as a test 
+#----------------------------------------------------------#
+
+p <- DimPlot(seurat_obj, group.by='lv2', raster=TRUE) + 
+    coord_equal() + hdWGCNA::umap_theme()
+
+pdf(paste0(fig_dir, 'seurat_umap.pdf'), width=12, height=8)
+p 
+dev.off()
+
+#----------------------------------------------------------#
+# Load the cluster marker genes and make a heatmap
+#----------------------------------------------------------#
+
+group_key <- 'lv2'
+
+# factor levels for the clusters (based on the dendrogram computed by scanpy)
+group_orders <- c(
+    'CD8 activated', 'CD8 pre-exhausted',
+    'CD8 NK-like', 'NKT', 'NKT / Tgd NCAM+', 'Tgd-V1', 
+    'T proliferating', 'Tregs proliferating', 
+    'CD8 metabolic', 'CD8 T resident', 'CD8 exhausted', 
+    'CD4 T follicular helper', 'Tregs', 'Tregs activated',
+    'CD4 IFN-response', 'CD8 IFN-response', 'Th-1',
+    'CD4 central memory', 'T naïve', 'CD4 central memory pre-Tfh', 
+    'CD8 IFNg+', 'CD8 effector', 'Tgd-17', 'Th-17', 'Tgd-V2 / MAIT-17'
+)
+
+seurat_obj$lv2 <- factor(
+    as.character(seurat_obj$lv2),
+    levels = group_orders
+)
+
+# load the cluster marker genes
+markers <- read.csv(paste0(data_dir, 'markers/', cur_celltype, '_subcluster_', group_key, '_markers.csv'))
+markers$group <- stringr::str_replace(markers$group, 'γδ', 'gd')
+markers$group <- factor(
+    as.character(markers$group), levels=group_orders
+)
+
+# filter markers:
+p_thresh <- 0.05
+lfc_thresh <- 1.0
+pct_in_thresh <- 10
+n_degs <- 5
+
+top_markers <- markers %>% 
+    subset(pvals_adj <= p_thresh & logfoldchanges >= lfc_thresh & pct_in_group >= pct_in_thresh) %>%
+    group_by(group) %>% 
+    slice_max(n=n_degs, order_by=desc(logfoldchanges))
+
+plot_genes <- top_markers$names
+
+
+p <- DotPlot(
+    seurat_obj,
+    group.by = 'lv2',
+    features = unique(plot_genes)
+)
+
+
+pdf(paste0(fig_dir, 'cluster_marker_gene_dotplot.pdf'), width=14, height=8, useDingbats=FALSE)
+p
+dev.off()
+
+```

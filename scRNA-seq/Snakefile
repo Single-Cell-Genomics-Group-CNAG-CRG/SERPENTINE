@@ -1,0 +1,53 @@
+import pandas as pd
+import itertools
+import yaml
+
+# define the config file to use 
+configfile: "config.yml"
+config_file = "config.yml"
+
+# load the config file
+with open(config_file, 'r') as f:
+    config = yaml.load(f, Loader=yaml.SafeLoader)
+    
+# get the list of networks that we will run!
+networks = list(config['networks'].keys())
+
+# get the output file locations from the config file
+out_dir = config['general']['out_dir'].rstrip('/')
+fig_dir = config['general']['fig_dir'].rstrip('/')
+data_dir = config['general']['data_dir'].rstrip('/')
+
+# ----------------------------------------------------------------------- #
+# All rule (define the outputs, wildcards)
+# ----------------------------------------------------------------------- #
+
+wildcard_constraints:
+    network = "|".join(networks)
+
+rule run_all:
+    input:
+        expand(f"{out_dir}/{{network}}/{data_dir}/{{network}}_hdWGCNA.rds", network=networks)
+
+# ----------------------------------------------------------------------- #
+# Run hdWGCNA
+# ----------------------------------------------------------------------- #
+
+rule run_hdWGCNA:
+    input:
+        conf = "config.yml"
+    output:
+        f"{out_dir}/{{network}}/{data_dir}/{{network}}_hdWGCNA.rds"
+    log:
+        "logs/run_hdWGCNA/{network}.log"
+    params:
+    threads: 8
+    resources:
+        mem_mb=128000
+    shell:
+        """
+        papermill run_hdWGCNA.ipynb \"{wildcards.network}.ipynb\" \
+            -p config_file {input.conf} \
+            -p wgcna_name \"{wildcards.network}\" \
+            > \"{log}\" 2>&1
+        """

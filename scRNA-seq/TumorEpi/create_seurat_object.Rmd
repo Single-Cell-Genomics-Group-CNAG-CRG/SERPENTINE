@@ -1,0 +1,148 @@
+
+```bash
+interactive 8 256G 12:00:00 genD
+module load GCC
+conda activate mpa
+```
+
+Create the Seurat object for the Tumor compartment.
+
+```{r eval=FALSE}
+
+library(Seurat) # packageVersion 5.1.0
+library(Matrix)
+library(tidyverse)
+library(cowplot)
+library(patchwork)
+library(arrow)
+theme_set(theme_cowplot())
+
+source('/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/scripts/plotting/plotting_functions.R')
+
+# set the project directory 
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/TumorEpi/')
+data_dir <- 'data/'
+fig_dir <- 'figures/'
+
+# define the cell type of interest
+cur_celltype <- 'TumorEpi'
+
+# re-load the seurat object
+# re-load the object
+# seurat_obj <- readRDS(file=   paste0("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/", cur_celltype, "/data/", cur_celltype, "_integrated_annotated_seurat.rds"))
+
+
+# load the raw & normalized counts:
+X_raw <- Matrix::readMM(paste0(data_dir, cur_celltype, '_integrated_annotated_counts.mtx'))
+X_norm <- Matrix::readMM(paste0(data_dir, cur_celltype, '_integrated_annotated_lognorm.mtx'))
+
+# load the cell meta-data (.obs table)
+obs_df <- read.table(
+    paste0(data_dir, cur_celltype, '_integrated_annotated_obs.csv'), 
+    sep=',', row.names=1, header=TRUE
+)
+
+# load the gene meta-data (.var table)
+var_df <- read.table(
+    paste0(data_dir, cur_celltype, '_integrated_annotated_var.csv'), 
+    sep=',', row.names=1, header=TRUE
+)
+
+# add gene & cell names to the expression matrices:
+colnames(X_raw) <- rownames(obs_df)
+colnames(X_norm) <- rownames(obs_df)
+rownames(X_raw) <- rownames(var_df)
+rownames(X_norm) <- rownames(var_df)
+
+#----------------------------------------------------------#
+# Create the Seurat object
+#----------------------------------------------------------#
+
+seurat_obj <- Seurat::CreateSeuratObject(
+    counts = X_raw,
+    data = X_norm,
+    meta.data = obs_df,
+    assay = 'RNA',
+    min.features = 0,
+    min.cells = 0,
+    project = 'SERPENTINE'
+)
+dim(seurat_obj)
+
+# set VariableFeatures in the RNA assay
+variable_feats <- subset(var_df, highly_variable == 'True') %>% rownames()
+VariableFeatures(seurat_obj) <- variable_feats
+
+#----------------------------------------------------------#
+# Add embeddings to the Seurat object
+#----------------------------------------------------------#
+
+# load the embeddings:
+# embedding_names <- c("X_pca_CellANOVA", "Cmat", "X_umap")
+embedding_names <- c("X_pca_CellANOVA", "X_umap")
+for(cur_name in embedding_names){
+    print(cur_name)
+    emb <- as.matrix(read.table(
+        paste0(data_dir, cur_celltype, '_integrated_annotated_', cur_name,'.csv'), 
+        sep=',', row.names=1, header=TRUE
+    ))
+    rownames(emb) <- colnames(seurat_obj)
+    colnames(emb) <- paste0(cur_name, 1:ncol(emb))
+    seurat_obj@reductions[[cur_name]] <- Seurat::CreateDimReducObject(
+        emb, key = cur_name, assay = 'RNA'
+    )
+}
+
+#----------------------------------------------------------#
+# Add cell neighborhood graphs to the Seurat object
+#----------------------------------------------------------#
+
+graph_names <- c('distances', 'connectivities')
+for(cur_name in graph_names){
+    print(cur_name)
+    cur_graph <- Matrix::readMM(paste0(data_dir, cur_celltype, '_integrated_annotated_obsp_', cur_name,'.mtx'))
+    rownames(cur_graph) <- colnames(seurat_obj)
+    colnames(cur_graph) <- colnames(seurat_obj)
+    seurat_obj@graphs[cur_name] <- Seurat::as.Graph(cur_graph)
+}
+
+
+#----------------------------------------------------------#
+# Remove the nCount and nFeature columns
+#----------------------------------------------------------# 
+
+tmp <- colnames(seurat_obj@meta.data)
+tmp <- tmp[!grepl('nCount', tmp)]
+tmp <- tmp[!grepl('nFeature', tmp)]
+seurat_obj@meta.data <- seurat_obj@meta.data[,tmp]
+
+#----------------------------------------------------------#
+# Fix / modify metadata columns as needed
+#
+# Nothing here yet
+#----------------------------------------------------------# 
+
+#----------------------------------------------------------#
+# Save the result
+#----------------------------------------------------------# 
+
+saveRDS(seurat_obj, file=  paste0("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/", cur_celltype, "/data/", cur_celltype, "_integrated_annotated_seurat.rds"))
+
+# re-load the object
+seurat_obj <- readRDS(file=   paste0("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/", cur_celltype, "/data/", cur_celltype, "_integrated_annotated_seurat.rds"))
+
+
+#----------------------------------------------------------#
+# Which SERPENTINE patients have suffient numebers of cells?
+#----------------------------------------------------------#
+
+meta <- seurat_obj@meta.data %>%
+    subset(
+        (Tissue %in% c("Liver", "Lung")) &
+        (Primary_tumor == "CRC") 
+    )
+
+table(meta$Patient, meta$Timepoint)
+
+
+```

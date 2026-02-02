@@ -1,0 +1,873 @@
+# launch an interactive node
+interactive 8 256G 12:00:00 genD
+
+# to launch:
+module load GCC
+conda activate compact
+
+
+```{r eval=FALSE}
+
+# input handling packages
+library(yaml)
+library(assertthat)
+
+# data wrangling & plotting packages
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+library(crayon)
+
+# single-cell & data analysis packages
+library(Seurat)
+library(Matrix)
+
+# network analysis
+library(WGCNA)
+library(hdWGCNA)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+
+library(SummarizedExperiment)
+library(MultiAssayExperiment)
+library(limma)
+
+# set the plotting theme
+theme_set(theme_cowplot())
+
+setwd('/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/hdWGCNA/TumorEpi/')
+
+# source helper functions
+source("../Tcells/scripts/helper_functions.R")
+source("../Tcells/scripts/plotting_functions.R")
+source("../Tcells/scripts/pseudobulk_functions.R")
+source('/home/groups/singlecell/smorabito/analysis/SERPENTINE/bin/DEG_snakemake_v4/scripts/plotting/plotting_functions.R')
+
+# load the configuration file:
+config_file <- "config.yml"
+config <- yaml::read_yaml(config_file)
+gen_opts <- config$general
+networks <- names(config$networks)
+
+fig_dir <- 'figures/'
+data_dir <- 'data/'
+
+# load the full Seurat object
+seurat_obj <- readRDS(config$seurat_path)
+
+networks <- c("Liver_T1", "Liver_T2", "Lung_T1", "Lung_T2", "Primary_T1", "Primary_T2")
+
+# load the individual seurat objects from each network analysis
+seurat_list <- lapply(networks, function(wgcna_name){
+    print(wgcna_name)
+    cur_obj <- readRDS(paste0(gen_opts$out_dir, '/', wgcna_name, '/', gen_opts$data_dir, '/', wgcna_name, '_hdWGCNA.rds'))
+    cur_obj
+})
+names(seurat_list) <- networks
+
+
+# # re-load the MultiAssayExperiment object:
+# mae <- readRDS(paste0(data_dir, "TumorEpi_pseudobulk_MAE.rds"))
+
+# # re-load the MAE object w/ meta-module info:
+# mae <- readRDS(paste0(data_dir, "TumorEpi_pseudobulk_MAE_metamodules.rds"))
+
+# # re-load metamodules graphs:
+# load(paste0(data_dir, "TumorEpi_pseudobulk_metamodules_graph.rda"))
+# names(mm_list)
+
+
+```
+
+Create proportion bar charts 
+
+Tumor clusters by Tissue 
+
+Tumor clusters by SERPENTINE patients
+
+```{r eval=FALSE}
+
+cluster_order <- table(seurat_obj$leiden_1)
+cluster_order <- rev(names(cluster_order)[order(cluster_order)])
+
+p <- ProportionBarPlotMulti(
+    seurat_obj %>% subset(Timepoint == 1), 
+    group_var = "leiden_1",
+    condition = "Tissue",
+    replicate_col = "Replicate",
+    order_groups = FALSE
+    #subset_cols = c("Timepoint"),
+    #subset_groups = c(1)
+)
+
+pdf(paste0(fig_dir, 'TumorEpi_stacked_bar_Tissue.pdf'), width=6, height=3, useDingbats=FALSE)
+p
+dev.off()
+
+
+patients_exclude <- c("Patient 01", "Patient 31", "Patient 15")
+
+
+
+cur_seurat <- seurat_obj %>% subset((Tissue %in% c("Liver", "Lung"))& (!Patient %in% patients_exclude) & (Primary_tumor == "CRC")) 
+meta <- cur_seurat@meta.data
+
+
+# Helper logic to generate the palette
+patient_col = "Patient"; tissue_col = "Tissue"
+  library(RColorBrewer)
+  
+  # Get unique patients per tissue
+  liver_patients <- unique(meta[meta[[tissue_col]] == "Liver", patient_col])
+  lung_patients  <- unique(meta[meta[[tissue_col]] == "Lung", patient_col])
+  
+  print(liver_patients)
+  print(lung_patients)
+
+
+  # Create color gradients
+  # colorRampPalette allows us to expand 3-9 brewer colors to any N
+  liver_colors <- colorRampPalette(brewer.pal(9, "Reds")[3:9])(length(liver_patients))
+  lung_colors  <- colorRampPalette(brewer.pal(9, "Blues")[3:9])(length(lung_patients))
+  
+  # Name the colors by patient ID
+  names(liver_colors) <- liver_patients
+  names(lung_colors)  <- lung_patients
+  
+patient_colors <- c(liver_colors, lung_colors)
+
+
+# p <- ProportionBarPlotMulti(
+#     cur_seurat,
+#     group_var = "leiden_1",
+#     condition = "Patient",
+#     replicate_col = "Replicate",
+#     order_groups = FALSE,
+#     custom_colors = patient_colors
+#     #subset_cols = c("Timepoint"),
+#     #subset_groups = c(1)
+# )
+
+# pdf(paste0(fig_dir, 'TumorEpi_stacked_bar_Patient.pdf'), width=6, height=3, useDingbats=FALSE)
+# p
+# dev.off()
+
+
+
+
+
+
+# p <- ProportionBarPlotMulti(
+#     seurat_obj %>% subset((Timepoint == 1) & (Tissue %in% c("Liver", "Lung")) & (!Patient %in% patients_exclude )), 
+#     group_var = "leiden_1",
+#     condition = "Tissue",
+#     replicate_col = "Replicate",
+#     order_groups = TRUE
+#     #custom_colors = patient_colors
+#     #subset_cols = c("Timepoint"),
+#     #subset_groups = c(1)
+# )
+
+# pdf(paste0(fig_dir, 'TumorEpi_stacked_bar_Tissue_ordered.pdf'), width=6, height=3, useDingbats=FALSE)
+# p
+# dev.off()
+
+# from Liver <--> Lung
+
+cluster_order <- as.character(c(
+    18, 1, 15, 8, 6,13,0, 9,  2, 12, 3, 7,5, 10, 4, 11,  
+    17 , 19, 14 ,16
+))
+
+
+cur_seurat$leiden_1 <- factor(as.character(cur_seurat$leiden_1), levels=cluster_order)
+
+
+# patient_colors <- generate_patient_palette(meta)
+patient_list <- unique(seurat_obj$Patient)
+names(patient_list) <- patient_list
+patient_list <- patient_list[names(patient_colors)]
+patient_colors <- patient_colors[names(patient_list)]
+
+#cur_seurat$leiden_1 <- factor(cur_seurat$leiden_1)
+cur_seurat$Patient <- factor(as.character(cur_seurat$Patient), levels=names(patient_colors))
+
+p <- ProportionBarPlotMulti(
+    cur_seurat, 
+    group_var = "leiden_1",
+    condition = "Patient",
+    replicate_col = "Replicate",
+    order_groups = FALSE,
+    custom_colors = patient_colors
+    #subset_cols = c("Timepoint"),
+    #subset_groups = c(1)
+)
+
+
+# the order is NOT WORKING still :()
+pdf(paste0(fig_dir, 'TumorEpi_stacked_bar_Patient.pdf'), width=6, height=3, useDingbats=FALSE)
+p
+dev.off()
+
+
+
+
+```
+
+
+calculate cancerSEA scores (later should move this section to part of the hdWGCNA analysis)
+
+```{r eval=FALSE}
+
+library(cancersea)
+library(UCell)
+library(decoupleR)
+
+cur_celltype <- 'TumorEpi'
+
+# re-load the object
+# seurat_obj <- readRDS(file=   paste0("/home/groups/singlecell/smorabito/analysis/SERPENTINE/July_2025/clustering/", cur_celltype, "/data/", cur_celltype, "_integrated_annotated_seurat.rds"))
+
+# set up a list:
+cancersea_list <- list(
+    "angiogenesis" = cancersea::angiogenesis$symbol,
+    "apoptosis" = cancersea::apoptosis$symbol,
+    "cell_cycle" = cancersea::cell_cycle$symbol,
+    "differentiation" = cancersea::differentiation$symbol,
+    "dna_damage" = cancersea::dna_damage$symbol,
+    "dna_repair" = cancersea::dna_repair$symbol,
+    "emt" = cancersea::emt$symbol,
+    "hypoxia" = cancersea::hypoxia$symbol,
+    "inflammation" = cancersea::inflammation$symbol,
+    "invasion" = cancersea::invasion$symbol,
+    "metastasis" = cancersea::metastasis$symbol,
+    "proliferation" = cancersea::proliferation$symbol,
+    "quiescence" = cancersea::quiescence$symbol,
+    "stemness" = cancersea::stemness$symbol 
+)
+
+# remove missing genes:
+for(pathway in names(cancersea_list)){
+    cur_genes <- cancersea_list[[pathway]]
+    cancersea_list[[pathway]] <- cur_genes[cur_genes %in% rownames(seurat_obj)]
+}
+
+ucell_meta <- UCell::AddModuleScore_UCell(
+    seurat_obj, features = cancersea_list, name=NULL
+)@meta.data
+
+
+ucell_meta <- ucell_meta[,names(cancersea_list)]
+
+write.table(ucell_meta, file=paste0(data_dir, 'cancerSEA_Ucell_scores.tsv'), sep='\t')
+
+meta <- seurat_obj@meta.data 
+seurat_obj@meta.data <- cbind(meta, ucell_meta)
+
+
+p1 <- FeatureEmbedding(
+  seurat_obj,
+  features = names(cancersea_list) ,
+  reduction = 'X_umap',
+  raster=TRUE, dpi=300,
+  ncol = 4,
+  plot_max = 'q100',
+  plot_min = 0.05,
+  colfunc = viridis::magma,
+  rev_colors = TRUE
+)
+
+pdf(paste0(fig_dir, 'cancerSEA_UCell_featureplot_markers.pdf'), width=16, height=10, useDingbats=FALSE)
+p1
+dev.off()
+
+
+
+p <- VlnPlot(
+    seurat_obj,
+    features = names(cancersea_list),
+    group.by = 'Patient',
+    pt.size=0, stack=TRUE
+)
+
+pdf(paste0(fig_dir, 'cancerSEA_UCell_vlnplot.pdf'), width=16, height=10, useDingbats=FALSE)
+p
+dev.off()
+
+
+seurat_obj@meta.data <- meta
+
+
+# plot EPCAM expression:
+
+
+p1 <- FeatureEmbedding(
+  seurat_obj,
+  features = 'EPCAM' ,
+  reduction = 'X_umap',
+  raster=TRUE, dpi=300,
+  ncol = 4,
+  plot_max = 'q100',
+  plot_min = 0,
+  colfunc = viridis::magma,
+  rev_colors = TRUE
+)
+
+pdf(paste0(fig_dir, 'featureplot_EPCAM.pdf'), width=7, height=6, useDingbats=FALSE)
+p1
+dev.off()
+
+```
+
+ Pseudobulk analysis with filtering 
+
+1. Calculate the pseudobulk representation of the dataset
+2. Filter the dataset 
+   - Only keep Liver and Lung tissues
+   - Remove low-quality pseudobulks
+
+Calculate pseudobulk MEs 
+
+```{r eval=FALSE}
+
+seurat_obj$Patient_Timepoint <- paste0(seurat_obj$Patient, ':T', seurat_obj$Timepoint)
+table(seurat_obj$Patient_Timepoint)
+
+# extract the counts matrix & cell-level meta-data from the Seurat object
+X <- GetAssayData(seurat_obj, layer='counts')
+meta <- seurat_obj@meta.data
+
+# create a pseudo-bulk SummarizedExperiment object
+se <- AggregatePseudobulk(
+    X, meta, 
+    replicate_col = "Patient_Timepoint", 
+    group_col = "Patient_Timepoint",
+    min_cells = 75
+)
+
+# select groups of interest
+se <- se[,
+    (colData(se)$Tissue %in% c('Liver', 'Lung')) &
+    (colData(se)$Timepoint %in% c(1,2)) &
+    (colData(se)$Primary_tumor == 'CRC')
+]
+
+# # exclude patients that don't have both timepoints
+# patients_keep <- intersect(
+#     colData(se) %>% subset(Timepoint == 1) %>% .$Patient %>% unique,
+#     colData(se) %>% subset(Timepoint == 2) %>% .$Patient %>% unique
+# )
+
+# se <- se[, colData(se)$Patient %in% patients_keep]
+# table(colData(se)$Tissue, colData(se)$Timepoint)
+
+# Remove genes with zero variance
+X_pb <- assays(se)$counts
+good_genes <- names(which(apply(X_pb, 1, sd) != 0))
+se <- se[good_genes,]
+
+# normalize the pseudobulk SummarizedExperiment
+se <- NormalizeCounts(
+    se, 
+    method = 'VST',
+    assay_name = 'counts'
+)
+
+#---------------------------------------------------------#
+# Visualize QC metrics
+#---------------------------------------------------------#
+
+plot_df <- as.data.frame(colData(se))
+
+p <- plot_df %>% 
+    ggplot(aes(x = nUMI, y = nFeatures)) + 
+    ggrastr::rasterise(geom_point(aes(color = Tissue, size = nCells)), dpi=300) + 
+    RotatedAxis() +
+    scale_x_continuous(labels = scales::comma) +
+    scale_y_continuous(labels = scales::comma) +
+    theme(
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.border = element_rect(linewidth=1,color='black', fill=NA),
+        panel.grid.major.y = element_line(linewidth=0.25, color='lightgrey'),
+        panel.grid.major.x = element_line(linewidth=0.25, color='lightgrey'),
+        strip.text = element_text(face='bold', size=8),
+        plot.title = element_text(hjust=0.5)
+    ) + 
+    ggtitle("Pseudobulk nUMI detected vs. nFeatures detected")
+
+pdf(paste0(fig_dir, 'Pseudobulk_filtered_QC_nUMI_vs_nFeatures.pdf'), width=7, height=5)
+print(p) 
+dev.off()
+
+
+```
+
+
+Calculate cancer SEA scores in the Pseudo-bulk dataset (for radar plot)
+
+```{r eval=FALSE}
+
+# set up a list:
+cancersea_list <- list(
+    "angiogenesis" = cancersea::angiogenesis$symbol,
+    "apoptosis" = cancersea::apoptosis$symbol,
+    "cell_cycle" = cancersea::cell_cycle$symbol,
+    "differentiation" = cancersea::differentiation$symbol,
+    "dna_damage" = cancersea::dna_damage$symbol,
+    "dna_repair" = cancersea::dna_repair$symbol,
+    "emt" = cancersea::emt$symbol,
+    "hypoxia" = cancersea::hypoxia$symbol,
+    "inflammation" = cancersea::inflammation$symbol,
+    "invasion" = cancersea::invasion$symbol,
+    "metastasis" = cancersea::metastasis$symbol,
+    "proliferation" = cancersea::proliferation$symbol,
+    "quiescence" = cancersea::quiescence$symbol,
+    "stemness" = cancersea::stemness$symbol 
+)
+
+pathway_order <- c(
+    "proliferation", "cell_cycle", "differentiation", "apoptosis",
+    "inflammation", "angiogenesis", "hypoxia", "quiescence",
+    "invasion", "metastasis", "emt", "stemness",
+    "dna_damage", "dna_repair"
+)
+
+# remove missing genes:
+for(pathway in names(cancersea_list)){
+    cur_genes <- cancersea_list[[pathway]]
+    cancersea_list[[pathway]] <- cur_genes[cur_genes %in% rownames(seurat_obj)]
+}
+
+# define the expression matrix to use
+X <- assays(se)$VST
+
+signature_df <- data.frame()
+for(cur_sig in names(cancersea_list)){
+    print(cur_sig)
+    cur_df <- data.frame(
+        signature = cur_sig,
+        gene_name = cancersea_list[[cur_sig]],
+        weight = 1
+    )
+
+
+    cur_signature_df <- decoupleR::run_ulm(
+        mat = X,
+        net = cur_df,
+        .source = 'signature',
+        .target = 'gene_name',
+        .mor = 'weight'
+    )
+    cur_signature_df$signature <- cur_sig
+  signature_df <- rbind(signature_df, cur_signature_df)
+
+}
+
+
+# cast from long to wide:
+signature_mat <- signature_df %>% 
+    dplyr::select(source, condition, score) %>%
+    tidyr::pivot_wider(
+        names_from = condition,
+        values_from = score,
+        values_fill = 0
+    ) %>%
+    as.data.frame()
+rownames(signature_mat) <- signature_mat$source
+signature_mat <- as.matrix(signature_mat[,-1])
+
+head(colnames(signature_mat))
+
+signature_mat <- signature_mat[,colnames(se)]
+
+# create a new SummarizedExperiment:
+assay_list <- list("decoupleR_ULM" = signature_mat)
+se_signatures <- SummarizedExperiment(
+    assay_list,
+    colData = colData(se)
+)
+
+
+# # re-order to match the se_modules object
+# signature_mat <- signature_mat[rownames(se_modules), colnames(se_modules)]
+
+# # add to the se_modules object
+# assays(se_modules)$decoupleR_ULM <- signature_mat
+
+
+mae <- MultiAssayExperiment(
+    experiments = list(
+        RNA = se,
+        cancerSEA = se_signatures
+    ),
+    colData = colData(se)
+)
+
+saveRDS(mae, paste0(data_dir, "TumorEpi_pseudobulk_MAE.rds"))
+
+mae <- readRDS(paste0(data_dir, "TumorEpi_pseudobulk_MAE.rds"))
+
+#---------------------------------------------------------#
+# prep the data for radar plot
+#---------------------------------------------------------#
+
+tmp <- subset(seurat_obj@meta.data, Patient == 'Patient 04')
+table(tmp$Timepoint)
+
+# order patients by response ratio:
+patient_order <- as.data.frame(colData(mae)) %>%
+    dplyr::select(c(Patient, Response_ratio)) %>%
+    distinct() %>%
+    mutate(Response_ratio = as.numeric(ifelse(is.na(Response_ratio), 20, Response_ratio))) %>%
+    arrange(Response_ratio) %>%
+    pull(Patient)
+
+# 1. Extract the ULM matrix
+# Assays in MAE are typically [Signatures x Samples]
+ulm_mat <- assays(experiments(mae)$cancerSEA)[["decoupleR_ULM"]]
+
+# 2. Convert to wide dataframe (Samples as rows, Signatures as columns)
+ulm_wide <- as.data.frame(t(ulm_mat))
+ulm_wide$Patient_Timepoint <- colData(mae)$Patient_Timepoint
+
+# 3. Extract selected metadata variables
+# Replace these with your actual column names (e.g., Patient_ID, Timepoint, Response)
+selected_meta <- as.data.frame(colData(mae)) %>%
+  select(Patient_Timepoint, Tissue, Timepoint, Patient) 
+
+# 4. Merge and Pivot to Long Format
+radar_df_long <- ulm_wide %>%
+  inner_join(selected_meta, by = "Patient_Timepoint") %>%
+  pivot_longer(
+    cols = rownames(ulm_mat), # Use the signature names from the original matrix rows
+    names_to = "Signature",
+    values_to = "Score"
+  )
+
+signature_df_scaled  <- radar_df_long %>%
+  group_by(Signature) %>%
+  mutate(score_scaled = scales::rescale(Score, to = c(0,1))) %>%
+  ungroup()
+
+# which patients have both timepoints?
+patient_list <- names(which(table(colData(mae)$Patient) > 1))
+patient_order <- patient_order[patient_order %in% patient_list]
+
+# set signature levels:
+signature_df_scaled$Signature <- factor(as.character(signature_df_scaled$Signature), levels=pathway_order)
+signature_df_scaled$Patient <- factor(as.character(signature_df_scaled$Patient), levels=patient_order)
+
+cur_patient <- patient_list[1]
+
+plot_list <- list()
+
+for(cur_patient in patient_order){
+
+
+    df_wide <- signature_df_scaled %>%
+        filter(Patient == cur_patient) %>%
+        pivot_wider(names_from = Signature, values_from = score_scaled)
+    
+    cur_tissue <- unique(df_wide$Tissue)
+
+    df_wide <- signature_df_scaled %>%
+        filter(Patient == cur_patient) %>%
+        select(Timepoint, Signature, score_scaled) %>% 
+        pivot_wider(names_from = Signature, values_from = score_scaled)
+
+    # Step 3: prep for ggradar
+    df_for_radar <- df_wide %>%
+        dplyr::rename(group = Timepoint) %>%
+        select(group, all_of(names(cancersea_list)))
+
+    df_for_radar <- df_for_radar[,c("group", pathway_order)]
+    
+    # get the response for this patient
+    cur_response <- as.data.frame(colData(mae)) %>%
+        subset(Patient == cur_patient) %>%
+        pull(Response_ratio) %>% unique %>% as.numeric()
+
+    p <- ggradar(df_for_radar,
+            grid.min = 0, grid.mid = 0.5, grid.max = 1,
+            axis.label.size = 2,
+            grid.label.size = 2,
+            group.line.width = 1,
+            group.point.size = 2,
+            fill = TRUE,
+            background.circle.colour = "white",
+            gridline.mid.colour = "grey",
+            # use ggplot2 default palette
+            group.colours = c("seagreen", "pink")
+            ) +
+        ggtitle(paste0(cur_patient, ', ', cur_tissue, ', Response: ', cur_response)) +
+        theme(legend.position = "bottom", plot.title=element_text(hjust=0.5, size=12)) 
+
+    plot_list[[cur_patient]] <- p
+
+}
+
+patch <- wrap_plots(plot_list, ncol=4)
+
+pdf(paste0(fig_dir, 'test_cancerSEA_radar3.pdf'), width=14, height=14)
+print(patch) 
+dev.off()
+
+
+
+signature_df_scaled$Timepoint <- ifelse(signature_df_scaled$Timepoint == 1, "Baseline", "Treatment")
+
+
+delta_df <- signature_df_scaled %>%
+  # 1. Ensure we have only ONE value per Patient/Signature/Timepoint
+  # We use mean() here just in case there are multiple tissues per patient
+  group_by(Patient, Signature, Timepoint) %>%
+  summarise(score_scaled = mean(score_scaled, na.rm = TRUE), .groups = "drop") %>%
+  
+  # 2. Pivot to get Baseline and Treatment as columns
+  pivot_wider(names_from = Timepoint, values_from = score_scaled) %>%
+  
+  # 3. Now Delta will work because the columns are numeric doubles, not lists
+  mutate(Delta = Treatment - Baseline) 
+
+
+
+p <- delta_df %>%
+    ggplot(aes(x=Patient, y = Signature)) + 
+    geom_tile(aes(fill=Delta), color='black') + 
+    scale_fill_gradient2(low = "dodgerblue", mid='whitesmoke', high='darkgoldenrod1', limits=c(-0.3,0.3), oob=scales::squish) +
+    coord_equal() +
+    scale_x_discrete(labels = function(x) gsub("Patient ", "", x)) +
+    theme( 
+    axis.title.y = element_blank(),
+    axis.line.y = element_blank(),
+    axis.line.x = element_blank(),
+    axis.title.x = element_blank(),
+)
+
+pdf(paste0(fig_dir, 'test_cancerSEA_summary.pdf'), width=5, height=4)
+print(p) 
+dev.off()
+
+# make another heatmap on the side to show the tumor response ratio:
+patient_df <- as.data.frame(colData(mae)) %>%
+    dplyr::select(c(Patient, Response_ratio)) %>%
+    distinct() %>%
+    mutate(Response_ratio = as.numeric(ifelse(is.na(Response_ratio), 20, Response_ratio))) %>%
+    arrange(Response_ratio) %>%
+    subset(Patient %in% patient_order) %>%
+    mutate(Patient = factor(as.character(Patient), levels=patient_order))
+
+p2 <- patient_df %>%
+    ggplot(aes(x = Patient, y='Response_ratio', fill = Response_ratio)) +
+    geom_tile(color='black') + 
+    scale_fill_gradient2(high = 'darkorange3', low='navy', mid='whitesmoke', midpoint=0, limits = c(-100, 100), oob = scales::squish) +
+  coord_equal()  +
+  scale_x_discrete(labels = function(x) gsub("Patient ", "", x)) +
+    theme( 
+    axis.title.y = element_blank(),
+    axis.line.y = element_blank(),
+    axis.line.x = element_blank(),
+    axis.title.x = element_blank(),
+)
+
+patch <- (p / p2) + plot_layout(heights=c(10,1), guides='collect')
+
+
+pdf(paste0(fig_dir, 'test_cancerSEA_summary2.pdf'), width=6, height=5)
+print(patch) 
+dev.off()
+
+```
+
+
+
+Calculate pseudo-bulk module eigengenes 
+
+```{r eval=FALSE}
+
+
+# get table of modules from the individual hdWGCNA networks 
+modules <- do.call(rbind, lapply(networks, function(cur_net){
+    cur_obj <- SetActiveWGCNA(seurat_list[[cur_net]], wgcna_name = cur_net)
+    # cur_modules <- GetModules(cur_obj)[,1:3] %>% subset(module != 'grey') %>% 
+       #  mutate(module = droplevels(module))
+    cur_modules <- GetHubGenes(cur_obj, n_hubs = Inf) %>%
+        dplyr::rename(weight = kME)
+    rownames(cur_modules) <- 1:nrow(cur_modules)
+    cur_modules$network <- cur_net 
+    cur_modules
+}))
+table(modules$module)
+
+write.csv(modules, file=paste0(data_dir, 'TumorEpi_modules_combined.csv'), quote=FALSE, row.names=FALSE)
+
+
+# keep only the top genes per factor ordered by value 
+n_genes <- 100
+modules <- modules %>% 
+    group_by(module) %>%
+    slice_max(n = n_genes, order_by = weight)
+
+modules1 <- modules
+modules2 <- modules
+
+
+
+mods1 <- unique(as.character(modules1$module)); mods1 <- mods1[mods1 != 'grey']
+mods2 <- unique(as.character(modules2$module)); mods2 <- mods2[mods2 != 'grey']
+
+
+genome.size <- length(union(modules1$gene_name, modules2$gene_name))
+
+# run overlaps between module gene lists and DEG lists:
+overlap_df <- do.call(rbind, lapply(mods1, function(cur_mod1){
+  cur_modules1_genes <- modules1 %>% subset(module == cur_mod1) %>% .$gene_name
+  cur_overlap_df <- do.call(rbind, lapply(mods2, function(cur_mod2){
+    print(paste0(cur_mod1, ' ', cur_mod2))
+    cur_modules2_genes <- modules2 %>% subset(module == cur_mod2) %>% .$gene_name
+    cur_overlap <- testGeneOverlap(newGeneOverlap(
+        cur_modules1_genes,
+        cur_modules2_genes,
+        genome.size=genome.size
+    ))
+    c(cur_overlap@odds.ratio, cur_overlap@pval, cur_overlap@Jaccard, length(cur_overlap@intersection))
+  })) %>% as.data.frame
+  colnames(cur_overlap_df) <- c('odds_ratio', 'pval', 'Jaccard', 'size_intersection')
+  cur_overlap_df$modules1 <- cur_mod1
+  cur_overlap_df$modules2 <- mods2
+
+  # module color:
+  #cur_overlap_df$color <- modules %>% subset(module == cur_mod) %>% .$color %>% unique
+  cur_overlap_df
+}))
+
+overlap_df$modules1 <- factor(as.character(overlap_df$modules1), levels=mods1)
+overlap_df$modules2 <- factor(as.character(overlap_df$modules2), levels=mods2)
+
+# adjust for multiple comparisons:
+overlap_df$fdr <- p.adjust(overlap_df$pval, method='fdr')
+
+# significance level:
+overlap_df$Significance <- gtools::stars.pval(overlap_df$fdr)
+overlap_df$Significance <- ifelse(
+  overlap_df$Significance == '.', '',
+  overlap_df$Significance
+)
+
+# hierarchical clustering of the module-module overlap matrix
+overlap_mat <- overlap_df %>% 
+    select(c(odds_ratio, modules1, modules2)) %>%
+    mutate(odds_ratio = ifelse(modules1 == modules2, 0, odds_ratio)) %>%
+    pivot_wider(values_from=odds_ratio, names_from=modules1) %>%
+    as.data.frame()
+rownames(overlap_mat) <- overlap_mat[,1] 
+overlap_mat <- as.matrix(overlap_mat[,2:ncol(overlap_mat)])
+dendro <- hclust(dist(overlap_mat))
+
+# order based on hierarchical clustering:
+overlap_df$modules1 <- factor(as.character(overlap_df$modules1), levels=dendro$labels[dendro$order])
+overlap_df$modules2 <- factor(as.character(overlap_df$modules2), levels=dendro$labels[dendro$order])
+
+
+overlap_df$pair <- paste0(as.character(overlap_df$modules1), '_', as.character(overlap_df$modules2))
+
+# save the pseudobulk module eigengene table:
+write.csv(overlap_df, file=paste0(data_dir, 'TumorEpi_module_pairwise_overlap.csv'), quote=FALSE, row.names=FALSE)
+
+
+#---------------------------------------------------------#
+# PCA Regression
+#---------------------------------------------------------#
+
+# calculate MEs for each of these modules
+se_modules <- PseudobulkModuleEigengenes(
+    se, 
+    modules = modules,
+    assay_name = "VST",
+    new_assay_name = "MEs"
+)
+
+
+#---------------------------------------------------------#
+# Calculate pseudo-bulk decoupleR ULM scores
+#---------------------------------------------------------#
+
+library(decoupleR)
+
+# # load the top hub genes per module
+# n_hubs <- 100
+# hub_df <- do.call(rbind, lapply(networks, function(cur_net){
+#     cur_obj <- SetActiveWGCNA(seurat_list[[cur_net]], wgcna_name = cur_net)
+#     cur_modules <- GetHubGenes(cur_obj, n_hubs = n_hubs) %>% 
+#         subset(module != 'grey') %>% 
+#         dplyr::mutate(module = droplevels(module)) %>%
+#         dplyr::group_by(module) %>%
+#         dplyr::slice_max(n=n_hubs, order_by=kME) %>%
+#         dplyr::rename(weight = kME)
+      
+#     cur_modules$network <- cur_net 
+#     cur_modules
+# }))
+
+# define the expression matrix to use
+X <- assays(se)$VST
+
+signature_df <- data.frame()
+for(cur_net in unique(modules$network)){
+
+  print(cur_net)
+  cur_df <- subset(modules, network == cur_net) 
+
+  cur_signature_df <- decoupleR::run_ulm(
+    mat = X,
+    net = cur_df,
+    .source = 'module',
+    .target = 'gene_name',
+    .mor = 'weight'
+  )
+
+  cur_signature_df$network <- cur_net
+  signature_df <- rbind(signature_df, cur_signature_df)
+
+}
+
+# cast from long to wide:
+signature_mat <- signature_df %>% 
+    dplyr::select(source, condition, score) %>%
+    tidyr::pivot_wider(
+        names_from = condition,
+        values_from = score,
+        values_fill = 0
+    ) %>%
+    as.data.frame()
+rownames(signature_mat) <- signature_mat$source
+signature_mat <- as.matrix(signature_mat[,-1])
+
+# re-order to match the se_modules object
+signature_mat <- signature_mat[rownames(se_modules), colnames(se_modules)]
+
+# add to the se_modules object
+assays(se_modules)$decoupleR_ULM <- signature_mat
+
+#---------------------------------------------------------#
+# Create a MultiAssayExperiment (MAE) object 
+# and save the results
+#---------------------------------------------------------#
+
+mae <- MultiAssayExperiment(
+    experiments = list(
+        RNA = se,
+        modules = se_modules
+    ),
+    colData = colData(se)
+)
+
+saveRDS(mae, paste0(data_dir, "Tcells_pseudobulk_MAE.rds"))
+
+
+```
+
+
